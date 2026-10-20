@@ -385,6 +385,14 @@ WebView2 的父句柄是面板自己的 HWND（`WA_NativeWindow` + `winId()`）�
 | 编译环境 | Qt 5.15.2 + VS2019 / qmake；插件只依赖 qscintilla | 云端 VS2022 + Qt 5.15.2 + CMake；**不链接 qscintilla** | §2.1 |
 | 兼容性 | Qt 版本一致 + **QScintilla ABI 一致** | 规避：不链 qscintilla，运行时 `GetProcAddress` 借宿主导出 | §4 |
 
+> ⚠️ **手册里的函数签名已经过时，照抄会 ABI 不匹配。**
+> 手册写的是 1.21 时代的写法：`std::function<QsciScintilla*()> getCurEdit`、
+> `std::function<bool(int, void*)> pluginCallBack`（没有 `QWidget*` 首参）。
+> 宿主源码 `plugin.h` 里的真实 typedef 已经加了首参：
+> `std::function<QsciScintilla*(QWidget*)> getCurEdit`、
+> `std::function<bool(QWidget*, int, void*)> pluginCallBack`。
+> **本插件跟的是宿主源码**（实测与 3.9.1 运行正常）。
+
 ### B. 依据宿主导出（实测值，宿主 3.9.1）
 
 | 事实 | 实测方式 | 值 |
@@ -426,10 +434,40 @@ WebView2 的父句柄是面板自己的 HWND（`WA_NativeWindow` + `winId()`）�
 3. 两者对不上（宿主改了导出） → 先信宿主导出表；导出真没了才走降级兜底
    （现在就有兜底：`QsciScintilla::text()` 取不到时退化为读磁盘上的文件，日志会写明走了哪条路）。
 
-### 可优化项（依据手册发现，尚未实现）
+### 对照官方文档发现的问题与优化点
 
-- **`pluginCallBack` 没用**：手册 2.0 起支持插件反向给主程序发消息（如新建文件）。
-  目前预览面板完全靠自己实现主程序联动，这是官方留给插件的正路。
+**① 只读文档上会周期性「滴」一声（真问题，建议修）**
+
+官方回调 `getCurEdit` 在宿主里落到 `CCNotePad::getCurEditView()`，而这个成员函数
+**对只读文档会 `QApplication::beep()` + 往状态栏打一行提示，然后返回 `nullptr`**
+（宿主源码 `ccnotepad.cpp`）。本插件每次刷新都调它，所以打开一个**只读**的 .md 时，
+默认 500 ms 一次刷新就响一次铃、状态栏反复刷提示。
+
+宿主自己的内置 Markdown 预览正是因此绕开了它 —— 源码注释写着「与 `getCurEditView()`
+相同的取法，但**不做只读拦截**：只读文档同样应该允许预览内容」。
+
+修法：先用 Qt 对象树找到编辑区并判断只读；**只读就直接用树里的指针，不去调宿主回调**，
+非只读才走官方回调（保持「当前标签页」语义）。这样既不响铃，也不改变正常路径。
+
+**② `pluginCallBack` 用不上（结论：暂不接）**
+
+手册说它「可以回调 NDD 主程序中的功能函数」，但把宿主源码里
+`CCNotePad::pluginInvoke()` 的 switch 展开后，实际只有两条命令：
+
+| cmdId | 作用 | 对本插件的价值 |
+|---|---|---|
+| 1 | 新建一个文件（`data` 可回传新文件路径） | 无 |
+| 2 | 设置当前编辑器语言（0=js / 1=json / 2=html） | 无 —— 没有 markdown 语言项 |
+
+所以这条「官方正路」目前对本插件没有可用命令，接了只是多一个依赖。
+
+**③ 跨模块 RTTI：我们的做法是对的**
+
+宿主源码注释明确警告：插件与主程序分属两个模块，跨模块 `dynamic_cast` /
+`qobject_cast` 不可靠，插件拿不到 `ui.editTabWidget`、也认不准编辑控件。
+所以本插件**不 link qscintilla、不 `dynamic_cast<ScintillaEditView*>`**，
+改用 `metaObject()->className()` 字符串比对 + 「单继承 ⇒ 基类偏移全为 0」的事实，
+把 `QWidget*` 直接当 `QsciScintilla*` 用。这条已被官方注释背书。
 
 ## 从源码构建
 
