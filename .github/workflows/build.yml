@@ -37,9 +37,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
           python -m pip install --upgrade pip
           python -m pip install aqtinstall
-          python -m aqt install-qt windows desktop $env:QT_VER $env:QT_ARCH -m qtbase --outputdir "${{ github.workspace }}\Qt"
+          # 注意：Qt 5.15 的 qtbase 在「基础包」里，不是独立模块，
+          # 所以用 --archives qtbase 选，不能用 -m qtbase（会报 packages not found）。
+          python -m aqt install-qt windows desktop $env:QT_VER $env:QT_ARCH --archives qtbase --outputdir "${{ github.workspace }}\Qt"
           Write-Host "--- qt root ---"
           Get-ChildItem "${{ github.workspace }}\Qt\$env:QT_VER" | Select-Object -ExpandProperty Name
+          Write-Host "--- cmake config ---"
+          Get-ChildItem "${{ github.workspace }}\Qt\$env:QT_VER\$env:QT_ARCH\lib\cmake" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
 
       - name: Configure
         shell: pwsh
