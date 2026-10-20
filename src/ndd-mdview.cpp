@@ -143,6 +143,8 @@ public:
 
 // this=RCX，返回 bool（AL）
 typedef bool (*SciBoolFn)(QsciScintilla* self);
+// this=RCX，返回 int（EAX）
+typedef int (*SciIntFn)(QsciScintilla* self);
 // this=RCX，参数 EDX/R8D/R9D，返回 long（EAX）
 typedef long (*SciSendFn)(QsciScintilla* self, unsigned int msg,
                           unsigned long wParam, long lParam);
@@ -1076,7 +1078,7 @@ void MdViewPanel::navigateToApp()
                 HRESULT hr = view3->SetVirtualHostNameToFolderMapping(
                     L"mdview.local", L"/",
                     reinterpret_cast<LPCWSTR>(KatexAssetDir().toStdWString().c_str()),
-                    COREWEBVIEW2_VIRTUAL_HOST_RESOURCE_ALL);
+                    COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
                 if (FAILED(hr))
                     qWarning() << "[ndd-mdview] 虚拟主机映射失败, hr=0x" << (quint32)hr;
             }
@@ -1243,6 +1245,17 @@ bool MdViewPanel::readCurrentText(QString& out)
                 qWarning() << "[ndd-mdview] isReadOnly(宿主指针) =" << ro;
             else
                 qWarning() << "[ndd-mdview] isReadOnly(宿主指针) -> 失败";
+            // 再验一下读到的确实是「活的」那个编辑器
+            if (ed) {
+                SciBoolFn isMod = reinterpret_cast<SciBoolFn>(ResolveExport(kIsModifiedSymbol));
+                SciIntFn curLine = reinterpret_cast<SciIntFn>(ResolveExport(kCurLineSymbol));
+                bool mod = false;
+                int line = -1;
+                if (isMod && SafeSciBool(isMod, reinterpret_cast<QsciScintilla*>(ed), &mod))
+                    qWarning() << "[ndd-mdview] isModified =" << mod;
+                if (curLine && SafeSciInt(curLine, reinterpret_cast<QsciScintilla*>(ed), &line))
+                    qWarning() << "[ndd-mdview] getCurrentLineNumber =" << line;
+            }
         }
     }
 
