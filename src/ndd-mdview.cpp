@@ -396,6 +396,7 @@ private:
     void createController();
     QString buildHtml(const QString& mdJs) const;
     void navigateToApp();
+    void pushCurrentText();
     void pollNow();
     void showError(const QString& msg);
 
