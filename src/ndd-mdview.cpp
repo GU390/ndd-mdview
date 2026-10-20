@@ -890,6 +890,7 @@ private:
     // --- 滚动同步 ---
     void setupScrollSync(QWidget* editor);
     int  editorFirstVisibleLine();
+    int  editorLineCount();
     void scrollEditorToLine(int line);
     void syncScrollFromEditor();
 
@@ -1708,33 +1709,55 @@ bool MdViewPanel::readCurrentText(QString& out)
     return false;
 }
 
+int MdViewPanel::editorLineCount()
+{
+    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
+        return -1;
+    int n = -1;
+    __try {
+        n = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                          SCI_GETLINECOUNT, 0, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+    return n;
+}
+
 void MdViewPanel::testScrollSync(int line)
 {
-    qWarning() << "[ndd-mdview] 同步测试: 把编辑区滚到第" << line << "行";
-    scrollEditorToLine(line);
-    QTimer::singleShot(1500, this, [this, line]() {
-        if (!m_view)
-            return;
-        // 一次性把网页侧的状态全问回来
-        ExecScriptHandler* h = new ExecScriptHandler(
-            [line](HRESULT code, LPCWSTR result) {
-                if (FAILED(code) || result == nullptr) {
-                    qWarning() << "[ndd-mdview] 同步测试: 问不到网页";
-                    return;
-                }
-                const QString s = QString::fromWCharArray(result);
-                qWarning() << "[ndd-mdview] 同步测试: 目标行 =" << line << " 网页侧 =" << s;
-            });
-        m_view->ExecuteScript(
-            L"(function(){"
-            L"var els=document.querySelectorAll('#md [data-line]');"
-            L"return 'dataLine='+els.length"
-            L"+' first='+(els.length?els[0].tagName+'@'+els[0].getAttribute('data-line'):'-')"
-            L"+' scrollY='+Math.round(window.pageYOffset||0)"
-            L"+' curLine='+(window.mdCurrentLine?window.mdCurrentLine():'no-fn')"
-            L"+' mdChild='+document.getElementById('md').children.length;})()",
-            h);
-        h->Release();
+    qWarning() << "[ndd-mdview] 同步测试: 初始 firstLine=" << editorFirstVisibleLine()
+               << " lineCount=" << editorLineCount()
+               << " sbValue=" << (m_scrollBar ? m_scrollBar->value() : -1);
+
+    // ① 用滚动条滚
+    if (m_scrollBar)
+        m_scrollBar->setValue(line);
+    QTimer::singleShot(600, this, [this, line]() {
+        qWarning() << "[ndd-mdview] 同步测试: ①滚条滚动后 firstLine=" << editorFirstVisibleLine()
+                   << " sbValue=" << (m_scrollBar ? m_scrollBar->value() : -1);
+        // ② 用 SCI_LINESCROLLTO 滚
+        scrollEditorToLine(line);
+        QTimer::singleShot(600, this, [this, line]() {
+            qWarning() << "[ndd-mdview] 同步测试: ②LINESCROLLTO后 firstLine=" << editorFirstVisibleLine()
+                       << " sbValue=" << (m_scrollBar ? m_scrollBar->value() : -1);
+            // ③ 问网页侧
+            ExecScriptHandler* h = new ExecScriptHandler(
+                [](HRESULT code, LPCWSTR result) {
+                    if (FAILED(code) || result == nullptr) {
+                        qWarning() << "[ndd-mdview] 同步测试: 问不到网页";
+                        return;
+                    }
+                    qWarning() << "[ndd-mdview] 同步测试: ③网页侧 =" << QString::fromWCharArray(result);
+                });
+            m_view->ExecuteScript(
+                L"(function(){"
+                L"var els=document.querySelectorAll('#md [data-line]');"
+                L"return 'dataLine='+els.length"
+                L"+' scrollY='+Math.round(window.pageYOffset||0)"
+                L"+' curLine='+(window.mdCurrentLine?window.mdCurrentLine():'no-fn');})()",
+                h);
+            h->Release();
+        });
     });
 }
 
