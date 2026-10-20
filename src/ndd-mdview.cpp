@@ -34,6 +34,7 @@
 #include <QMenu>
 #include <QTimer>
 #include <QString>
+#include <QStringList>
 #include <QByteArray>
 #include <QFile>
 #include <QDir>
@@ -255,6 +256,7 @@ private:
 
     QPointer<QWidget> m_host;
     HWND m_hwnd = nullptr;
+    QString m_pluginDir;
 
     ComPtr<ICoreWebView2Environment> m_env;
     ComPtr<ICoreWebView2Controller> m_ctrl;
@@ -336,6 +338,8 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
 
 bool MdViewPanel::start(const QString& pluginDir)
 {
+    m_pluginDir = pluginDir;
+
     setAttribute(Qt::WA_NativeWindow, true);
     m_hwnd = reinterpret_cast<HWND>(winId());
     if (m_hwnd == nullptr) {
@@ -440,12 +444,31 @@ void MdViewPanel::navigateToApp()
     if (!m_view)
         return;
 
-    QFile f(QString::fromUtf8(kMarkdownItResource));
+    // markdown-it 脚本：优先用编译进 DLL 的 Qt 资源；
+    // 资源缺失时回退到插件目录下的同名文件。
     QString mdJs;
-    if (f.open(QIODevice::ReadOnly)) {
-        mdJs = QString::fromUtf8(f.readAll());
-    } else {
-        mdJs = QStringLiteral("/* markdown-it 资源缺失 */");
+    {
+        QFile f(QString::fromUtf8(kMarkdownItResource));
+        if (f.open(QIODevice::ReadOnly)) {
+            mdJs = QString::fromUtf8(f.readAll());
+        } else {
+            const QStringList candidates = {
+                QDir(m_pluginDir).filePath(QStringLiteral("markdown-it.min.js")),
+                QDir(m_pluginDir).filePath(QStringLiteral("mdview/markdown-it.min.js")),
+            };
+            for (const QString& p : candidates) {
+                QFile g(p);
+                if (g.open(QIODevice::ReadOnly)) {
+                    mdJs = QString::fromUtf8(g.readAll());
+                    break;
+                }
+            }
+        }
+    }
+    if (mdJs.isEmpty()) {
+        showError(QStringLiteral("找不到 markdown-it 脚本："
+                                 "既没有编译进 DLL，也没有放在插件目录下。"));
+        return;
     }
 
     const QString html = buildHtml(mdJs);
