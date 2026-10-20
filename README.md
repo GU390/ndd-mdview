@@ -14,6 +14,7 @@
   标题层级、水平线 —— 全部由 [markdown-it 14.1.0](https://github.com/markdown-it/markdown-it) 渲染。
 - **样式干净**：类 GitHub 的浅色排版，中文友好（微软雅黑）。
 - **不链接 qscint**：取文本只借宿主导出的一个符号，不引入 qscintilla 的类布局依赖（见下）。
+- **不崩宿主**：取文调用外面裹了 SEH，任何意外都只跳过这一轮，不影响宿主。
 
 ## 安装
 
@@ -37,7 +38,7 @@
 
 ### 文本是怎么取到的
 
-宿主把 qscintilla 静态链进了 `qmyedit_qt5.dll`。踩了三轮才对：
+宿主把 qscintilla 静态链进了 `qmyedit_qt5.dll`。踩了四轮才对，过程值得记下来：
 
 **第 1 轮：Win32 的 SCI 消息 —— 不成立。**
 打算枚举主窗口的子孙窗口，找 Scintilla 原生窗口发 `SCI_GETTEXT`。
@@ -46,7 +47,7 @@
 QWidget（`ScintillaQt`），`SCI_*` 走的是 `ScintillaBase::SendMessage` 虚调用，
 不是 Win32 消息，发不出去。
 
-**第 2 轮：调宿主导出的 `QsciScintilla::text()` —— 找到函数了，却崩了宿主。**
+**第 2 轮：调宿主导出的 `QsciScintilla::text()` —— 崩宿主。**
 `qmyedit_qt5.dll` 的导出表里带着 qscintilla 的全部符号（实测 2403 项），
 其中就有：
 
@@ -55,65 +56,57 @@ QWidget（`ScintillaQt`），`SCI_*` 走的是 `ScintillaBase::SendMessage` 虚�
 ```
 
 宿主自己的 Markdown 预览（`CCNotePad::slot_markdownPreview`）用的也正是
-`pEditView->text()`。所以第一版就照这个思路做：只声明一个同名同签名的最小类，
-`GetProcAddress` 拿地址后调用。
+`pEditView->text()`。所以只声明一个同名同签名的最小类，
+`GetProcAddress` 拿地址后调用 —— 结果两次都把宿主带崩了：
 
-结果一调用就 **0xc0000005 崩在 `qmyedit_qt5.dll` 里**：
+| 现象 | 原因 |
+|---|---|
+| `0xC0000005` 崩在 `qmyedit_qt5.dll` 的 `SendScintilla` 入口 +0xd | 返回槽被当成了 `this`，`mov rcx,[rcx+0x30]` 解引用野指针 |
+| `0xC0000409`（BEX64 栈/缓冲区溢出）崩在 Qt5Core 的消息输出路径 | 崩在调用中间，返回槽里留了个半构造的 `QString`，它的析构函数把堆踩坏了 |
 
-```
-错误模块名称: qmyedit_qt5.dll    异常代码: 0xc0000005    错误偏移量: 0x1c3d7d
-```
+第二个坑的修法：**返回槽用裸缓冲（`alignas(8) unsigned char[64]`），不要用
+QString 局部变量**。崩了就直接丢弃这块内存，不会有半构造对象等着析构。
+另外 `__try/__except` 块里不能放需要回卷的 C++ 对象（MSVC 报 C2712），
+所以把「调用」和「拷贝 QString」拆成两个函数。
 
-把偏移映射回导出符号，落在 `QsciScintillaBase::SendScintilla` 入口 +0xd
-（第一次解引用 `this`）。再 dump 那个导出函数的机器码核对寄存器：
+**第 3 轮：找编辑区。**
+宿主 ABI 里的 `getCurEdit` 仿函数能拿到当前编辑区指针；
+保险起见还走 Qt 自己的对象树找一遍（`findChildren<QWidget*>()` +
+`metaObject()->className() == "ScintillaEditView"`，并优先选祖先里有
+`QTabWidget` 的那个 —— 宿主的主编辑区是 `ui.editTabWidget` 的页，
+别处也可能藏着 ScintillaEditView）。
+实测两个来源返回**同一个地址**，互相印证。
 
-```
-text():          mov r14, rdx   ← this = RDX      mov rbp, rcx  ← sret = RCX
-SendScintilla(): mov rcx, [rcx+30h]                ← 第一条就解引用 this
-```
-
-寄存器约定和本插件写的一致 ⇒ **不是调用约定问题，是传进去的 `this` 是垃圾**。
-而这个 `this` 来自宿主 ABI 里的 `std::function<QsciScintilla*(QWidget*)>` 仿函数
-（`getCurEdit`）。跨模块的 `std::function` 到底发生了什么不好深究，
-**不再依赖它**。
-
-**第 3 轮（现在用的）：用 Qt 自己的对象树定位编辑区。**
-
-宿主主窗口 → `findChildren<QWidget*>()` → 用 `metaObject()->className()`
-认 `"ScintillaEditView"` → 有焦点的优先，否则取可见里最大的那个。
-这条路上全是 Qt 自己的 API（`metaObject()` 是虚函数，vtable 在宿主 EXE 里，
-跨模块调用完全安全）。
-
-关键前提是继承链：
+**第 4 轮（就是现在这版）：调用约定搞反了。**
+用 capstone 反汇编 `qmyedit_qt5.dll` 里 `text()` 的真实机器码：
 
 ```
-ScintillaEditView : QsciScintilla : QsciScintillaBase
-                  : QAbstractScrollArea : QFrame : QWidget : QObject
+mov r14, rdx          ; 取入口 RDX
+mov rbp, rcx          ; 存入口 RCX
+mov edx, 0x887        ; msg = SCI_GETTEXTLENGTH
+call SendScintilla    ; RCX 没动 —— 而 SendScintilla 内部是 mov rcx,[rcx+30]
+...
+mov rax, r14          ; 返回槽地址放 RAX
 ```
 
-**全是单继承 ⇒ 所有基类子对象偏移都是 0 ⇒ `QWidget*` 就是 `QsciScintilla*`。**
-所以拿 QWidget* 直接当 QsciScintilla* 传给 `text()` 是对的。
+`SendScintilla` 内部把 RCX 当 `this` 解引用，所以 **RCX 必须是 `this`**；
+而入口的 **RDX 才是隐藏返回缓冲区**。
 
-插件里只声明一个**同名同签名的最小类**：
+**⇒ 成员函数按值返回类类型时，MSVC x64 是 `RCX=this`、`RDX=返回槽`；
+自由函数才是 `RCX=返回槽`、`RDX=第一个实参`。**
+我一开始套用了自由函数的规则 → 被调方把返回槽当 `this` → 越界 → 崩。
 
-```cpp
-class QsciScintilla { public: QString text() const; };
-typedef QString (*SciTextFn)(QsciScintilla* self);
-```
+改对之后一切正常：文本取到、实时更新、不崩宿主。
 
-用 `GetProcAddress` 拿真实函数地址后调用。`text()` 是**非虚**成员函数，
-调用时编译器只把 `this` 原样传下去，不需要知道真实类的布局 ——
-所以**不需要 `qsciscintilla.h`，也不链接 qscintilla**，
-宿主升级改了 `QsciScintilla` 的成员布局也不会崩。
+最终取文只依赖两个纯 Win32 事实：宿主 qscintilla 那个 DLL 的导出表里有
+`text()`，以及上面这条调用约定。**不链接 qscintilla、不需要它的头文件、
+不依赖它的类布局**（`text()` 是非虚成员，调用时 `this` 原样传下去）。
 
-另外在调用外面裹了一层 `__try/__except`：万一指针不对，只跳过这一轮，
-不会把宿主带崩（上一版就是崩在宿主里的）。
+另外还兜了两手：`SendScintilla(SCI_GETLENGTH/SCI_GETTEXT)`（纯 POD 参数与返回），
+以及读磁盘文件（编辑区的 `filePath` 动态属性）——
+后者看不到未保存的改动，只在前两条都失败时才用，触发时会在日志里明确警告。
 
-代价是：得靠 `GetProcAddress` 认符号名，宿主哪天把 `text()` 改名就得跟着改。
-找不到符号时插件会照常加载，只是预览没有内容（停靠窗格标题会写明原因）。
-
-切换标签页后编辑区对象会换，所以每次轮询都重新找一次当前编辑区。
-
+切换标签页后编辑区对象会换，所以每次轮询都重新取一次当前编辑区。
 ### 文本怎么传给网页
 
 用 base64：编辑区文本先转 UTF-8，再 base64，注入
@@ -165,6 +158,10 @@ cmake --build build --config Release
 - 只渲染**当前**编辑区，不做多标签分屏。
 - 宿主是便携版（`NO_PLUGIN` 宏已定义）时才支持插件；官方的「便携版不支持插件」
   提示对应的是另一个构建分支。
+- 取文依赖宿主 qscintilla 导出表里的 `QsciScintilla::text()`。宿主哪天把这个
+  符号改名/去掉，插件会退化成「读磁盘上的文件」—— 能出内容，但看不到未保存的改动，
+  停靠窗格标题会提示。日志里会明确写出走了哪条路。
+- 超大文件（几十 MB）每次轮询都要整篇取一遍，会有可感知的开销。
 
 ## 许可
 
