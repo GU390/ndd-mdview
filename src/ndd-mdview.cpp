@@ -61,6 +61,7 @@
 #include <QHideEvent>
 #include <QResizeEvent>
 #include <QDebug>
+#include <QDateTime>
 
 #include <functional>
 #include <vector>
@@ -846,6 +847,7 @@ private:
     QString m_status;
     bool m_pageReady = false;
     bool m_usePostMessage = false;   // 页面是否支持原生消息通道
+    qint64 m_lastStatsMs = 0;        // 渲染统计的节流时间戳
 };
 
 // --- 面板实现 ---------------------------------------------------------------
@@ -1256,6 +1258,13 @@ void MdViewPanel::pushCurrentText()
         return;
     m_lastText = m_currentText;
     setStatus(QStringLiteral("实时 | %1 字符").arg(m_currentText.size()));
+
+    // 渲染统计（节流到 2 秒一次）：既是诊断信息，也方便确认公式渲染是否生效
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - m_lastStatsMs > 2000) {
+        m_lastStatsMs = now;
+        logRenderStats();
+    }
 
     if (m_usePostMessage) {
         // 原生消息通道：直接把文本字符串推给网页，
