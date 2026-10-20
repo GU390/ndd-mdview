@@ -322,6 +322,7 @@ static QWidget* FindCurrentEditor(QWidget* host)
 #define SCI_SETSEL            2160
 #define SCI_ENSUREVISIBLE     2232   // 把光标最小幅度滚进视野（不会跳）
 #define SCI_SETREADONLY       2171   // 设只读（宿主 Scintilla.h 的值，测试钩子用）
+#define SCI_GETREADONLY       2140   // 读只读标志（回读校验用）
 // 这版 Scintilla 已经没有 SCI_LINESCROLLTO 了（2168=SCI_LINESCROLL, 2169=SCI_SCROLLCARET），
 // 所以滚动只能用 QScintilla 的 firstVisibleLine()/setFirstVisibleLine()。
 
@@ -1988,10 +1989,17 @@ void MdViewPanel::pollNow()
     // 调试钩子：把编辑区真的设成只读（宿主对只读文档会响铃，这条路径平时碰不到）
     if (m_testRO && !m_testRODone && m_sendFn && m_lastEditor.data()) {
         m_testRODone = true;
-        m_sendFn(reinterpret_cast<QsciScintilla*>(m_lastEditor.data()),
-                 SCI_SETREADONLY, 1, 0);
-        qWarning() << "[ndd-mdview] 测试钩子: 已把编辑区设为只读 (SCI_SETREADONLY=2171)"
-                      << (m_testForceHostCall ? "，并强制走宿主回调（旧行为）" : "");
+        QsciScintilla* roEd = reinterpret_cast<QsciScintilla*>(m_lastEditor.data());
+        m_sendFn(roEd, SCI_SETREADONLY, 1, 0);
+        // 回读校验：发出去 ≠ 真的生效（老教训：消息发出去不等于宿主执行了）
+        long roBack = m_sendFn(roEd, SCI_GETREADONLY, 0, 0);
+        bool roApi = false;
+        SafeSciBool(m_isROFn, roEd, &roApi);
+        qWarning() << "[ndd-mdview] 测试钩子: 已发 SCI_SETREADONLY"
+                      << " | 回读 SCI_GETREADONLY =" << roBack
+                      << " | QsciScintilla::isReadOnly() =" << roApi
+                      << " | 指针 =" << (void*)roEd
+                      << (m_testForceHostCall ? " | 强制走宿主回调（旧行为）" : "");
     }
 
     QString text;
@@ -2028,10 +2036,20 @@ bool MdViewPanel::readCurrentText(QString& out)
     if ((!edReadOnly || m_testForceHostCall) && m_getCurEdit)
         fromHost = m_getCurEdit(m_host.data());
 
+    if (m_testRO) {
+        // 诊断：我们的只读判断 vs 宿主回调实际返回了什么
+        qWarning() << "[ndd-mdview] [只读诊断] edReadOnly=" << (edReadOnly ? 1 : 0)
+                      << " | 宿主回调返回 =" << (void*)fromHost
+                      << " | Qt树指针 =" << (void*)ed
+                      << " | lastEditor =" << (void*)m_lastEditor.data();
+    }
+
     if (edReadOnly && !m_roSkipLogged) {
         m_roSkipLogged = true;
-        qWarning() << "[ndd-mdview] 当前文档只读：已跳过宿主 getCurEdit 回调"
-                      "（否则宿主会响铃并往状态栏刷提示）";
+        qWarning() << "[ndd-mdview] 当前文档只读："
+                   << (m_testForceHostCall
+                       ? "（调试 hostcall 模式）仍然强制调用了宿主 getCurEdit 回调"
+                       : "已跳过宿主 getCurEdit 回调（否则宿主会响铃并往状态栏刷提示）");
     }
 
     // 事件驱动的信号要挂在「当前」编辑区上
