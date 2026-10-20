@@ -114,6 +114,8 @@ public:
 
 // this=RCX，返回 bool（AL）
 typedef bool (*SciBoolFn)(QsciScintilla* self);
+// this=RCX，返回 int（EAX）
+typedef int (*SciIntFn)(QsciScintilla* self);
 // this=RCX，参数 EDX/R8D/R9D，返回 long（EAX）
 typedef long (*SciSendFn)(QsciScintilla* self, unsigned int msg,
                           unsigned long wParam, long lParam);
@@ -122,6 +124,8 @@ typedef void (*SciTextFn)(void* retSlot, void* self);
 
 // 宿主 qscintilla 那个 DLL 里的修饰名
 static const char* kIsReadOnlySymbol = "?isReadOnly@QsciScintilla@@QEBA_NXZ";
+static const char* kIsModifiedSymbol = "?isModified@QsciScintilla@@QEBA_NXZ";
+static const char* kCurLineSymbol = "?getCurrentLineNumber@QsciScintilla@@QEBAHXZ";
 static const char* kSendScintillaSymbol = "?SendScintilla@QsciScintillaBase@@QEBAJIKJ@Z";
 static const char* kTextSymbol = "?text@QsciScintilla@@QEBA?AVQString@@XZ";
 
@@ -194,6 +198,18 @@ static void* ResolveExport(const char* symbol)
 //  QWidget* == QsciScintilla* == 同一个地址。
 //  于是拿 QWidget* 直接当 QsciScintilla* 传给 SendScintilla 是对的。
 // ---------------------------------------------------------------------------
+// 祖先里有没有 QTabWidget —— 宿主的主编辑区是 ui.editTabWidget 的页，
+// 别处（比如查找结果面板）也可能藏着 ScintillaEditView，要认准这个。
+static bool HasTabAncestor(QWidget* w)
+{
+    for (QWidget* p = w ? w->parentWidget() : nullptr; p; p = p->parentWidget()) {
+        const QMetaObject* mo = p->metaObject();
+        if (mo && qstrcmp(mo->className(), "QTabWidget") == 0)
+            return true;
+    }
+    return false;
+}
+
 static QWidget* FindCurrentEditor(QWidget* host)
 {
     if (host == nullptr)
@@ -202,6 +218,8 @@ static QWidget* FindCurrentEditor(QWidget* host)
     QWidget* focus = QApplication::focusWidget();
     QWidget* best = nullptr;
     long bestArea = -1;
+    QWidget* bestTab = nullptr;
+    long bestTabArea = -1;
 
     const QList<QWidget*> kids = host->findChildren<QWidget*>();
     for (int i = 0; i < kids.size(); ++i) {
@@ -213,16 +231,24 @@ static QWidget* FindCurrentEditor(QWidget* host)
             continue;
         if (!w->isVisible())
             continue;
-        if (w == focus)
-            return w;                       // 有焦点的优先
+
         const QRect r = w->rect();
         const long area = (long)r.width() * (long)r.height();
+
+        if (HasTabAncestor(w)) {
+            if (area > bestTabArea) {
+                bestTabArea = area;
+                bestTab = w;
+            }
+        }
+        if (w == focus)
+            return w;                       // 有焦点的优先
         if (area > bestArea) {
             bestArea = area;
             best = w;
         }
     }
-    return best;
+    return bestTab ? bestTab : best;
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +319,17 @@ static bool SafeSciText(SciSendFn send, QsciScintilla* ed, char* buf, int cap, i
 
 // 探针：bool isReadOnly() const（this=RCX，返回 AL）
 static bool SafeSciBool(SciBoolFn fn, QsciScintilla* ed, bool* out)
+{
+    __try {
+        *out = fn(ed);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 探针：int getCurrentLineNumber() const（this=RCX，返回 EAX）
+static bool SafeSciInt(SciIntFn fn, QsciScintilla* ed, int* out)
 {
     __try {
         *out = fn(ed);
@@ -993,6 +1030,24 @@ bool MdViewPanel::readCurrentText(QString& out)
                 qWarning() << "[ndd-mdview] isReadOnly(宿主指针) =" << ro;
             else
                 qWarning() << "[ndd-mdview] isReadOnly(宿主指针) -> 失败";
+        }
+        // 决定性探针：读到的是不是「活的」那个编辑器？
+        if (ed) {
+            SciBoolFn isMod = reinterpret_cast<SciBoolFn>(ResolveExport(kIsModifiedSymbol));
+            SciIntFn curLine = reinterpret_cast<SciIntFn>(ResolveExport(kCurLineSymbol));
+            bool mod = false;
+            int line = -1;
+            if (isMod && SafeSciBool(isMod, reinterpret_cast<QsciScintilla*>(ed), &mod))
+                qWarning() << "[ndd-mdview] isModified =" << mod;
+            else
+                qWarning() << "[ndd-mdview] isModified -> 失败";
+            if (curLine && SafeSciInt(curLine, reinterpret_cast<QsciScintilla*>(ed), &line))
+                qWarning() << "[ndd-mdview] getCurrentLineNumber =" << line;
+            else
+                qWarning() << "[ndd-mdview] getCurrentLineNumber -> 失败");
+            // 文件里的长度，用来和 text() 的长度对账
+            const QString path = ed->property("filePath").toString();
+            qWarning() << "[ndd-mdview] filePath =" << path;
         }
     }
 
