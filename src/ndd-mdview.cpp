@@ -947,7 +947,7 @@ private:
     void updateSignalConnection();
     QString modeLabel() const;
     void updateTitle();
-    bool editorSelectionLines(int* l1, int* l2);
+    bool editorSelectionLines(int* l1, int* l2, bool* hasRange = nullptr);
     void syncSelectionFromEditor();
 
     // --- 滚动同步 ---
@@ -965,12 +965,17 @@ private:
     SciTextFn m_textFn = nullptr;
     char* m_buf = nullptr;
     int m_bufCap = 0;
-    QWidget* m_lastEditor = nullptr;
-    QWidget* m_connEditor = nullptr;
-    QWidget* m_connTab = nullptr;
+    // ⚠️ 这几个编辑区指针必须是 QPointer，不能是裸 QWidget*：
+    //    100ms 的滚动/选区轮询一直在用它们，而关掉标签页时宿主会
+    //    销毁 ScintillaEditView —— 裸指针就变成悬垂指针，
+    //    SendScintilla 会去已释放的内存上取 vtable（SEH 拦不住这种
+    //    use-after-free，崩在 Qt5Core 里，症状是「莫名其妙崩了」）。
+    QPointer<QWidget> m_lastEditor;
+    QPointer<QWidget> m_connEditor;
+    QPointer<QWidget> m_connTab;
     bool m_signalConnected = false;
     // 滚动同步
-    QWidget* m_scrollEditor = nullptr;
+    QPointer<QWidget> m_scrollEditor;
     SciIntFn m_firstLineFn = nullptr;
     SciVoidIntFn m_setFirstLineFn = nullptr;
     QTimer* m_scrollPoll = nullptr;
@@ -979,6 +984,11 @@ private:
     int m_lastSelL1 = 0;
     int m_lastSelL2 = 0;
     qint64 m_scrollSuppressUntil = 0;
+    // 选区同步的抑制窗口必须**独立**于滚动的那个：
+    // 用户在预览里点一下/拖一下，浏览器往往同时发滚动事件（光标滚进视野），
+    // 'L' 先到就把 m_scrollSuppressUntil 撑开，随后到的 'S'（选区）
+    // 会被同一个窗口一起误杀 —— 表现就是「在右边选了，左边不动」。
+    qint64 m_selSuppressUntil = 0;
     bool m_probed = false;
     bool m_warnedFallback = false;
     MdSettings m_settings;
@@ -1051,22 +1061,22 @@ void MdViewPanel::updateTitle()
 
 void MdViewPanel::connectEditor(QWidget* ed)
 {
-    if (m_connEditor == ed) {
+    if (m_connEditor.data() == ed) {
         updateSignalConnection();
         return;
     }
 
-    if (m_connEditor)
-        m_connEditor->disconnect(this);
+    if (!m_connEditor.isNull())
+        m_connEditor.data()->disconnect(this);
     m_connEditor = ed;
     m_signalConnected = false;
     updateSignalConnection();
 
     // 标签页切换时换编辑区
     QWidget* tab = FindTabAncestor(ed);
-    if (m_connTab != tab) {
-        if (m_connTab)
-            m_connTab->disconnect(this);
+    if (m_connTab.data() != tab) {
+        if (!m_connTab.isNull())
+            m_connTab.data()->disconnect(this);
         m_connTab = tab;
         if (tab)
             QObject::connect(tab, SIGNAL(currentChanged(int)), this, SLOT(onTabCurrentChanged(int)));
@@ -1077,23 +1087,23 @@ void MdViewPanel::connectEditor(QWidget* ed)
 // 选了固定间隔就断开信号，改为纯定时轮询 —— 否则用户设了 5 秒也照样实时刷。
 void MdViewPanel::updateSignalConnection()
 {
-    const bool want = (m_settings.refreshMode == 0) && (m_connEditor != nullptr);
+    const bool want = (m_settings.refreshMode == 0) && (!m_connEditor.isNull());
     if (want == m_signalConnected)
         return;
-    if (m_signalConnected && m_connEditor)
-        m_connEditor->disconnect(this);
+    if (m_signalConnected && !m_connEditor.isNull())
+        m_connEditor.data()->disconnect(this);
     m_signalConnected = false;
     if (want) {
         // 字符串式连接：不需要 QsciScintilla 的类定义。
         // QsciScintilla 有 textChanged() 信号（宿主自己就用它连 Markdown 预览）。
-        QObject::connect(m_connEditor, SIGNAL(textChanged()), this, SLOT(onEditorTextChanged()));
+        QObject::connect(m_connEditor.data(), SIGNAL(textChanged()), this, SLOT(onEditorTextChanged()));
         m_signalConnected = true;
     }
 }
 
 void MdViewPanel::setupScrollSync(QWidget* editor)
 {
-    if (m_scrollEditor == editor)
+    if (m_scrollEditor.data() == editor)
         return;
 
     m_scrollEditor = editor;
@@ -1125,11 +1135,11 @@ void MdViewPanel::setupScrollSync(QWidget* editor)
 
 int MdViewPanel::editorFirstVisibleLine()
 {
-    if (m_firstLineFn == nullptr || m_scrollEditor == nullptr)
+    if (m_firstLineFn == nullptr || m_scrollEditor.isNull())
         return -1;
     int line = -1;
     __try {
-        line = m_firstLineFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor));
+        line = m_firstLineFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
@@ -1138,11 +1148,11 @@ int MdViewPanel::editorFirstVisibleLine()
 
 int MdViewPanel::editorLineCount()
 {
-    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
+    if (m_sendFn == nullptr || m_scrollEditor.isNull())
         return -1;
     int n = -1;
     __try {
-        n = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+        n = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()),
                           SCI_GETLINECOUNT, 0, 0);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
@@ -1152,10 +1162,10 @@ int MdViewPanel::editorLineCount()
 
 void MdViewPanel::scrollEditorToLine(int line)
 {
-    if (m_setFirstLineFn == nullptr || m_scrollEditor == nullptr || line < 0)
+    if (m_setFirstLineFn == nullptr || m_scrollEditor.isNull() || line < 0)
         return;
     __try {
-        m_setFirstLineFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor), line);
+        m_setFirstLineFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()), line);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
@@ -1198,24 +1208,27 @@ void MdViewPanel::onWebScroll(int line)
 // ---------------------------------------------------------------------
 
 // 编辑区当前选区的起止行号（1 基；没有选区返回 false）
-bool MdViewPanel::editorSelectionLines(int* l1, int* l2)
+// hasRange：有真实选区（不是只有一个光标）时为 true。
+//   只有光标时不往预览里做原生选区 —— 否则用户每敲一行，
+//   预览的选区就跟着跳一下，页面还会乱滚。
+bool MdViewPanel::editorSelectionLines(int* l1, int* l2, bool* hasRange)
 {
-    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
+    if (m_sendFn == nullptr || m_scrollEditor.isNull())
         return false;
     int start = -1, end = -1, ls = -1, le = -1;
     __try {
-        start = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+        start = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()),
                               SCI_GETSELECTIONSTART, 0, 0);
-        end = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+        end = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()),
                             SCI_GETSELECTIONEND, 0, 0);
-        ls = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+        ls = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()),
                            SCI_LINEFROMPOSITION, (unsigned long)start, 0);
-        le = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+        le = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()),
                            SCI_LINEFROMPOSITION, (unsigned long)end, 0);
         // 选区终点正好落在下一行行首时（用户拖到行首就松手），
         // 实际覆盖到的是上一行行尾，这里把 le 收回来，别多高亮一个块。
         if (end > start && le > ls) {
-            int lineStart = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+            int lineStart = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()),
                                           SCI_POSITIONFROMLINE, (unsigned long)le, 0);
             if (lineStart == end)
                 le -= 1;
@@ -1227,20 +1240,23 @@ bool MdViewPanel::editorSelectionLines(int* l1, int* l2)
         return false;
     *l1 = ls + 1;
     *l2 = le + 1;
+    if (hasRange)
+        *hasRange = (end > start);
     return true;
 }
 
-// 编辑区选区变了 -> 高亮预览里相交的块
+// 编辑区选区变了 -> 高亮预览里相交的块，并在预览里做真正的原生选区
 void MdViewPanel::syncSelectionFromEditor()
 {
     if (!m_view || !m_pageReady || !m_settings.syncSelection)
         return;
     int l1 = 0, l2 = 0;
-    if (!editorSelectionLines(&l1, &l2)) {
+    bool hasRange = false;
+    if (!editorSelectionLines(&l1, &l2, &hasRange)) {
         if (m_lastSelL1 != 0 || m_lastSelL2 != 0) {
             m_lastSelL1 = 0;
             m_lastSelL2 = 0;
-            m_view->ExecuteScript(L"window.mdHighlight && window.mdHighlight(0,0);", nullptr);
+            m_view->ExecuteScript(L"window.mdSyncSelection && window.mdSyncSelection(0,0,false);", nullptr);
         }
         return;
     }
@@ -1248,8 +1264,12 @@ void MdViewPanel::syncSelectionFromEditor()
         return;
     m_lastSelL1 = l1;
     m_lastSelL2 = l2;
-    qWarning() << "[ndd-mdview] 选区同步: 编辑区选区 ->" << l1 << ".." << l2 << "，推给网页";
-    const QString js = QStringLiteral("window.mdHighlight && window.mdHighlight(%1,%2);").arg(l1).arg(l2);
+    qWarning() << "[ndd-mdview] 选区同步: 编辑区选区 ->" << l1 << ".." << l2
+               << (hasRange ? "（有选区）" : "（仅光标）") << "，推给网页";
+    // 自己推过去的选区，页面会再发一个 'S' 回来 —— 这是回声，要挡掉。
+    m_selSuppressUntil = QDateTime::currentMSecsSinceEpoch() + 400;
+    const QString js = QStringLiteral("window.mdSyncSelection && window.mdSyncSelection(%1,%2,%3);")
+        .arg(l1).arg(l2).arg(hasRange ? QStringLiteral("true") : QStringLiteral("false"));
     m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), nullptr);
 }
 
@@ -1286,19 +1306,25 @@ void MdViewPanel::onWebSelection(int l1, int l2)
 {
     if (!m_settings.syncSelection || l1 <= 0 || l2 < l1)
         return;
-    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
+    if (m_sendFn == nullptr || m_scrollEditor.isNull())
         return;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    if (now < m_scrollSuppressUntil)
+    // ⚠️ 这里**不能**查 m_scrollSuppressUntil：
+    //    用户在预览里拖选时，浏览器常常同时发滚动事件（光标滚进视野），
+    //    'L' 先到会把滚动窗口撑开，随后到的 'S' 就被一起误杀了 ——
+    //    表现就是「右边选了，左边不动」。选区要用自己的回声窗口。
+    if (now < m_selSuppressUntil)
         return;
     int gs = -1, ge = -1;
-    if (!SciSelectLines(m_sendFn, reinterpret_cast<QsciScintilla*>(m_scrollEditor), l1, l2,
+    if (!SciSelectLines(m_sendFn, reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()), l1, l2,
                         &gs, &ge)) {
         qWarning() << "[ndd-mdview] 选区同步: 网页行" << l1 << ".." << l2
                    << "-> 编辑区选中失败（回读 gs=" << gs << " ge=" << ge << "）";
         return;
     }
     m_scrollSuppressUntil = now + 250;
+    // 把编辑区滚到选中的位置，否则选中行在视口外，用户看不到「同步」了
+    scrollEditorToLine(l1 - 1);
     qWarning() << "[ndd-mdview] 选区同步: 网页行 " << l1 << ".." << l2
                << " -> 编辑区选中（位置 " << gs << ".." << ge << "，回读确认）";
 }
@@ -1313,6 +1339,13 @@ void MdViewPanel::onEditorTextChanged()
 void MdViewPanel::onTabCurrentChanged(int)
 {
     m_lastEditor = nullptr;   // 强制重新定位编辑区
+    // 换标签页时旧编辑区可能已经被销毁（QPointer 会自动置空），
+    // 这里把滚动/选区同步的基准也清掉，下一轮重新绑定到新编辑区。
+    m_scrollEditor = nullptr;
+    m_lastEditorLine = -1;
+    m_lastWebLine = -1;
+    m_lastSelL1 = 0;
+    m_lastSelL2 = 0;
     m_lastText.clear();
     refreshNow();
 }
@@ -1432,6 +1465,35 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "      if (hit) { els[i].classList.add('md-sel'); }"
         "      else { els[i].classList.remove('md-sel'); }"
         "    }"
+        "  };"
+        /* 编辑区选中了 s..e 行 -> 预览里做**真正的原生选区**（这样左右两边
+           选中的文字才真的对上，而不是只给整块加个黄底）。
+           doSelect=false（编辑区只有一个光标时）只高亮整块，
+           不动预览的原生选区 —— 否则用户每敲一行，预览就跟着跳一下。 */
+        "  window.mdSyncSelection = function(s, e, doSelect){"
+        "    if (!s || !e) { window.mdHighlight && window.mdHighlight(0,0); return 'clear'; }"
+        "    var els = lineEls(), i, a, b, first = null, last = null;"
+        "    for (i = 0; i < els.length; i++){"
+        "      a = parseInt(els[i].getAttribute('data-line'), 10);"
+        "      b = parseInt(els[i].getAttribute('data-line2'), 10) || a;"
+        "      if (a <= e && b >= s){ if (!first) { first = els[i]; } last = els[i]; }"
+        "    }"
+        "    window.mdHighlight && window.mdHighlight(s, e);"
+        "    if (!doSelect || !first || !last) { return 'highlight-only'; }"
+        "    try {"
+        "      var r = document.createRange();"
+        "      if (first.childNodes.length) { r.setStart(first, 0); } else { r.setStartBefore(first); }"
+        "      if (last.childNodes.length) { r.setEnd(last, last.childNodes.length); } else { r.setEndAfter(last); }"
+        "      var sel = window.getSelection();"
+        "      sel.removeAllRanges();"
+        "      sel.addRange(r);"
+        "      var rect = first.getBoundingClientRect();"
+        "      var vh = window.innerHeight || 0;"
+        "      if (rect.bottom < 0 || (vh && rect.top > vh)) {"
+        "        try { first.scrollIntoView({block:'center'}); } catch(e2){}"
+        "      }"
+        "      return 'ok';"
+        "    } catch(e){ return 'err:' + e; }"
         "  };"
         /* 预览里选中了内容 -> 返回对应的行号区间 */
         "  window.mdSelectionLines = function(){"
@@ -1837,7 +1899,7 @@ bool MdViewPanel::readCurrentText(QString& out)
     QWidget* ed = FindCurrentEditor(m_host.data());
 
     // 事件驱动的信号要挂在「当前」编辑区上
-    if (ed != m_lastEditor) {
+    if (ed != m_lastEditor.data()) {
         m_lastEditor = ed;
         connectEditor(ed);
         setupScrollSync(ed);
@@ -1971,10 +2033,10 @@ void MdViewPanel::testScrollSync(int line)
 
 void MdViewPanel::testSelectionSync(int l1, int l2)
 {
-    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
+    if (m_sendFn == nullptr || m_scrollEditor.isNull())
         return;
     int gs = -1, ge = -1;
-    if (!SciSelectLines(m_sendFn, reinterpret_cast<QsciScintilla*>(m_scrollEditor), l1, l2,
+    if (!SciSelectLines(m_sendFn, reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()), l1, l2,
                         &gs, &ge)) {
         qWarning() << "[ndd-mdview] 选区自测: 选中失败（回读不符 gs=" << gs << " ge=" << ge << "）";
         return;
@@ -2191,7 +2253,7 @@ public:
 // ===========================================================================
 //  宿主 ABI 导出
 // ===========================================================================
-static MdController* g_controller = nullptr;
+static QPointer<MdController> g_controller;
 
 extern "C" {
 
@@ -2204,7 +2266,7 @@ NDD_EXPORT bool NDD_PROC_IDENTIFY(NDD_PROC_DATA* pProcData)
     pProcData->m_strComment = QString::fromUtf8(u8"在编辑区右侧渲染 Markdown，"
                                                 u8"支持公式（KaTeX），"
                                                 u8"基于 Microsoft Edge WebView2");
-    pProcData->m_version = QString::fromUtf8(u8"v1.4");
+    pProcData->m_version = QString::fromUtf8(u8"v1.5");
     pProcData->m_auther = QString::fromUtf8(u8"ndd-mdview");
     pProcData->m_menuType = 1;   // 二级菜单，宿主把 m_rootMenu 交给我们
     return true;
@@ -2321,7 +2383,7 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
             ctl->host ? ctl->host.data() : nullptr,
             QStringLiteral("Markdown 预览 (WebView2)"),
             QStringLiteral(
-                "Notepad-- 插件 · v1.4\n\n"
+                "Notepad-- 插件 · v1.5\n\n"
                 "在编辑区右侧用 Microsoft Edge WebView2 渲染 Markdown。\n"
                 "支持 GFM 表格、任务列表、围栏代码块、引用，"
                 "以及 $...$ / $$...$$ 公式（KaTeX）。\n\n"
