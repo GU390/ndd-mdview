@@ -293,6 +293,7 @@ static QWidget* FindCurrentEditor(QWidget* host)
 #define SCI_GETTEXT        2182
 #define SCI_GETCODEPAGE    2137
 #define SCI_GETFIRSTVISIBLELINE 2153
+#define SCI_GETLINECOUNT     2154
 #define SCI_LINESCROLLTO   2160
 
 // 在 4GB 以下申请一块缓冲区。
