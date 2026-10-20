@@ -108,6 +108,8 @@ struct MdSettings
     int  refreshMode   = 0;    // 见 kRefreshIntervals
     bool katex        = true;  // 公式渲染
     bool releaseOnHide = true; // 隐藏面板时释放 WebView2 内存
+    bool syncScroll   = true;  // 滚动同步
+    bool syncSelection = true; // 选区同步
 
     static MdSettings load()
     {
@@ -119,6 +121,8 @@ struct MdSettings
             s.refreshMode = 0;
         s.katex = st.value(QStringLiteral("katex"), true).toBool();
         s.releaseOnHide = st.value(QStringLiteral("releaseOnHide"), true).toBool();
+        s.syncScroll = st.value(QStringLiteral("syncScroll"), true).toBool();
+        s.syncSelection = st.value(QStringLiteral("syncSelection"), true).toBool();
         return s;
     }
 
@@ -129,6 +133,8 @@ struct MdSettings
         st.setValue(QStringLiteral("refreshMode"), refreshMode);
         st.setValue(QStringLiteral("katex"), katex);
         st.setValue(QStringLiteral("releaseOnHide"), releaseOnHide);
+        st.setValue(QStringLiteral("syncScroll"), syncScroll);
+        st.setValue(QStringLiteral("syncSelection"), syncSelection);
         st.sync();
     }
 };
@@ -299,6 +305,11 @@ static QWidget* FindCurrentEditor(QWidget* host)
 #define SCI_GETCODEPAGE    2137
 #define SCI_GETFIRSTVISIBLELINE 2153
 #define SCI_GETLINECOUNT     2154
+#define SCI_GETSELECTIONSTART 2143
+#define SCI_GETSELECTIONEND   2144
+#define SCI_LINEFROMPOSITION  2146
+#define SCI_POSITIONFROMLINE  2167
+#define SCI_SETSEL            2304
 #define SCI_LINESCROLLTO   2160
 
 // 在 4GB 以下申请一块缓冲区。
@@ -417,17 +428,18 @@ static void TakeTextFromSlot(void* slot, QString* out)
 // ===========================================================================
 static const char* kMarkdownItResource = ":/mdview/markdown-it.min.js";
 static const char* kMathPluginResource = ":/mdview/mdview-math.js";
+static const char* kGithubCssResource = ":/mdview/github-markdown.css";
 static const char* kKatexJsResource    = ":/mdview/katex.min.js";
 static const char* kKatexCssResource   = ":/mdview/katex.min.css";
 static const char* kKatexFontResource  = ":/mdview/fonts/";
 static const char* kKatexMarker        = "assets.ok";
 
-// 临时目录：%TEMP%\ndd-mdview\katex-0.16.11
-static QString KatexAssetDir()
+// 临时目录：%TEMP%\ndd-mdview\web
+static QString WebAssetDir()
 {
     return QDir(QDir::tempPath())
         .filePath(QStringLiteral("ndd-mdview") + QDir::separator()
-                  + QStringLiteral("katex-0.16.11"));
+                  + QStringLiteral("web"));
 }
 
 // 把一个资源写成文件
@@ -444,10 +456,12 @@ static bool WriteResourceToFile(const QString& resPath, const QString& filePath)
     return true;
 }
 
-// 解包 KaTeX 资源（幂等：靠标记文件判断是否已解过）
-static bool ExtractKatexAssets(QString* err)
+// 解包网页要用的静态资源（幂等：靠标记文件判断是否已解过）
+//   github-markdown.css —— 现成的成熟排版（MIT），不再手写
+//   katex.min.js / katex.min.css / fonts\*.woff2 —— 公式排版
+static bool ExtractWebAssets(bool withKatex, QString* err)
 {
-    const QString dir = KatexAssetDir();
+    const QString dir = WebAssetDir();
     QDir d(dir);
     if (!d.exists() && !d.mkpath(QStringLiteral("."))) {
         *err = QStringLiteral("无法创建临时目录：%1").arg(dir);
@@ -458,23 +472,31 @@ static bool ExtractKatexAssets(QString* err)
     if (QFile::exists(marker))
         return true;
 
-    // 字体
-    const QString fontDir = d.filePath(QStringLiteral("fonts"));
-    QDir().mkpath(fontDir);
-    QDir res(QStringLiteral(":/mdview/fonts"));
-    const QStringList fonts = res.entryList(QDir::Files);
-    for (int i = 0; i < fonts.size(); ++i) {
-        if (!WriteResourceToFile(QStringLiteral(":/mdview/fonts/") + fonts.at(i),
-                                 d.filePath(QStringLiteral("fonts/") + fonts.at(i)))) {
-            *err = QStringLiteral("解包字体失败：%1").arg(fonts.at(i));
-            return false;
-        }
+    if (!WriteResourceToFile(QString::fromLatin1(kGithubCssResource),
+                             d.filePath(QStringLiteral("github-markdown.css")))) {
+        *err = QStringLiteral("解包 github-markdown.css 失败");
+        return false;
     }
 
-    if (!WriteResourceToFile(QString::fromLatin1(kKatexJsResource), d.filePath(QStringLiteral("katex.min.js")))
-        || !WriteResourceToFile(QString::fromLatin1(kKatexCssResource), d.filePath(QStringLiteral("katex.min.css"))) ) {
-        *err = QStringLiteral("解包 KaTeX 脚本失败");
-        return false;
+    if (withKatex) {
+        // 字体
+        const QString fontDir = d.filePath(QStringLiteral("fonts"));
+        QDir().mkpath(fontDir);
+        QDir res(QStringLiteral(":/mdview/fonts"));
+        const QStringList fonts = res.entryList(QDir::Files);
+        for (int i = 0; i < fonts.size(); ++i) {
+            if (!WriteResourceToFile(QStringLiteral(":/mdview/fonts/") + fonts.at(i),
+                                     d.filePath(QStringLiteral("fonts/") + fonts.at(i)))) {
+                *err = QStringLiteral("解包字体失败：%1").arg(fonts.at(i));
+                return false;
+            }
+        }
+
+        if (!WriteResourceToFile(QString::fromLatin1(kKatexJsResource), d.filePath(QStringLiteral("katex.min.js")))
+            || !WriteResourceToFile(QString::fromLatin1(kKatexCssResource), d.filePath(QStringLiteral("katex.min.css"))) ) {
+            *err = QStringLiteral("解包 KaTeX 脚本失败");
+            return false;
+        }
     }
 
     QFile m(marker);
@@ -775,6 +797,17 @@ public:
     void setSettings(const MdSettings& s) { m_settings = s; }
     MdSettings settings() const { return m_settings; }
 
+    // 设置变了：更新定时器策略（连不连信号）、标题，公式开关变了就重载页面
+    void applySettings(const MdSettings& s)
+    {
+        const bool needReload = (m_settings.katex != s.katex);
+        m_settings = s;
+        applyRefreshMode();
+        updateTitle();
+        if (needReload)
+            reloadPage();
+    }
+
     // 状态显示在停靠窗格标题上，方便一眼看出卡在哪一步
     void setStatus(const QString& s)
     {
@@ -811,6 +844,8 @@ public slots:
     void onTabCurrentChanged(int index);
     // 网页滚动了（预览 -> 编辑区）
     void onWebScroll(int line);
+    // 网页里选了内容（预览 -> 编辑区）
+    void onWebSelection(int l1, int l2);
 
 protected:
     void resizeEvent(QResizeEvent* e) override
@@ -851,6 +886,7 @@ protected:
             syncBounds();
             m_lastText.clear();
             pushCurrentText();
+            updateTitle();
         });
     }
 
@@ -892,6 +928,11 @@ private:
     void logChildren() const;
     void applyRefreshMode();
     void connectEditor(QWidget* ed);
+    void updateSignalConnection();
+    QString modeLabel() const;
+    void updateTitle();
+    bool editorSelectionLines(int* l1, int* l2);
+    void syncSelectionFromEditor();
 
     // --- 滚动同步 ---
     void setupScrollSync(QWidget* editor);
@@ -911,6 +952,7 @@ private:
     QWidget* m_lastEditor = nullptr;
     QWidget* m_connEditor = nullptr;
     QWidget* m_connTab = nullptr;
+    bool m_signalConnected = false;
     // 滚动同步
     QWidget* m_scrollEditor = nullptr;
     SciIntFn m_firstLineFn = nullptr;
@@ -918,6 +960,8 @@ private:
     QTimer* m_scrollPoll = nullptr;
     int m_lastEditorLine = -1;
     int m_lastWebLine = -1;
+    int m_lastSelL1 = 0;
+    int m_lastSelL2 = 0;
     qint64 m_scrollSuppressUntil = 0;
     bool m_probed = false;
     bool m_warnedFallback = false;
@@ -946,6 +990,9 @@ private:
 
 void MdViewPanel::applyRefreshMode()
 {
+    // 信号连不连，取决于当前模式
+    updateSignalConnection();
+
     if (!m_poll)
         return;
     const int interval = kRefreshIntervals[m_settings.refreshMode];
@@ -964,20 +1011,40 @@ void MdViewPanel::applyRefreshMode()
         m_poll->start();
 }
 
+// 当前更新模式的文字（显示在停靠窗格标题上）
+QString MdViewPanel::modeLabel() const
+{
+    const int i = m_settings.refreshMode;
+    if (i <= 0)
+        return QStringLiteral("实时");
+    const int ms = kRefreshIntervals[i];
+    if (ms < 1000)
+        return QStringLiteral("每 %1 毫秒").arg(ms);
+    return QStringLiteral("每 %1 秒").arg(ms / 1000);
+}
+
+// 标题统一格式：Markdown 实时预览 | 模式 | 字符数
+void MdViewPanel::updateTitle()
+{
+    if (!m_dock)
+        return;
+    m_dock->setWindowTitle(QStringLiteral("Markdown 实时预览 | %1 | %2 字符")
+                            .arg(modeLabel())
+                            .arg(m_currentText.size()));
+}
+
 void MdViewPanel::connectEditor(QWidget* ed)
 {
-    if (m_connEditor == ed)
+    if (m_connEditor == ed) {
+        updateSignalConnection();
         return;
+    }
 
     if (m_connEditor)
         m_connEditor->disconnect(this);
     m_connEditor = ed;
-
-    if (ed) {
-        // 字符串式连接：不需要 QsciScintilla 的类定义。
-        // QsciScintilla 有 textChanged() 信号（宿主自己就用它连 Markdown 预览）。
-        QObject::connect(ed, SIGNAL(textChanged()), this, SLOT(onEditorTextChanged()));
-    }
+    m_signalConnected = false;
+    updateSignalConnection();
 
     // 标签页切换时换编辑区
     QWidget* tab = FindTabAncestor(ed);
@@ -987,6 +1054,24 @@ void MdViewPanel::connectEditor(QWidget* ed)
         m_connTab = tab;
         if (tab)
             QObject::connect(tab, SIGNAL(currentChanged(int)), this, SLOT(onTabCurrentChanged(int)));
+    }
+}
+
+// 「实时」模式才连 textChanged 信号（事件驱动）；
+// 选了固定间隔就断开信号，改为纯定时轮询 —— 否则用户设了 5 秒也照样实时刷。
+void MdViewPanel::updateSignalConnection()
+{
+    const bool want = (m_settings.refreshMode == 0) && (m_connEditor != nullptr);
+    if (want == m_signalConnected)
+        return;
+    if (m_signalConnected && m_connEditor)
+        m_connEditor->disconnect(this);
+    m_signalConnected = false;
+    if (want) {
+        // 字符串式连接：不需要 QsciScintilla 的类定义。
+        // QsciScintilla 有 textChanged() 信号（宿主自己就用它连 Markdown 预览）。
+        QObject::connect(m_connEditor, SIGNAL(textChanged()), this, SLOT(onEditorTextChanged()));
+        m_signalConnected = true;
     }
 }
 
@@ -1011,8 +1096,10 @@ void MdViewPanel::setupScrollSync(QWidget* editor)
     if (!m_scrollPoll) {
         m_scrollPoll = new QTimer(this);
         m_scrollPoll->setInterval(100);
-        QObject::connect(m_scrollPoll, &QTimer::timeout,
-                         this, [this]() { syncScrollFromEditor(); });
+        QObject::connect(m_scrollPoll, &QTimer::timeout, this, [this]() {
+            syncScrollFromEditor();
+            syncSelectionFromEditor();
+        });
     }
     if (isVisible())
         m_scrollPoll->start();
@@ -1059,7 +1146,7 @@ void MdViewPanel::scrollEditorToLine(int line)
 
 void MdViewPanel::syncScrollFromEditor()
 {
-    if (!m_view || !m_pageReady)
+    if (!m_view || !m_pageReady || !m_settings.syncScroll)
         return;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (now < m_scrollSuppressUntil)     // 正在做同步，忽略回声
@@ -1077,7 +1164,7 @@ void MdViewPanel::syncScrollFromEditor()
 
 void MdViewPanel::onWebScroll(int line)
 {
-    if (line <= 0)
+    if (line <= 0 || !m_settings.syncScroll)
         return;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (now < m_scrollSuppressUntil)      // 回声，忽略
@@ -1088,6 +1175,83 @@ void MdViewPanel::onWebScroll(int line)
     m_scrollSuppressUntil = now + 250;
     qWarning() << "[ndd-mdview] 滚动同步: 网页行 ->" << line << "，滚编辑区";
     scrollEditorToLine(line - 1);
+}
+
+// ---------------------------------------------------------------------
+//  选区同步
+// ---------------------------------------------------------------------
+
+// 编辑区当前选区的起止行号（1 基；没有选区返回 false）
+bool MdViewPanel::editorSelectionLines(int* l1, int* l2)
+{
+    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
+        return false;
+    int start = -1, end = -1, ls = -1, le = -1;
+    __try {
+        start = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                              SCI_GETSELECTIONSTART, 0, 0);
+        end = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                            SCI_GETSELECTIONEND, 0, 0);
+        ls = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                           SCI_LINEFROMPOSITION, (unsigned long)start, 0);
+        le = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                           SCI_LINEFROMPOSITION, (unsigned long)end, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    if (ls < 0 || le < ls)
+        return false;
+    *l1 = ls + 1;
+    *l2 = le + 1;
+    return true;
+}
+
+// 编辑区选区变了 -> 高亮预览里相交的块
+void MdViewPanel::syncSelectionFromEditor()
+{
+    if (!m_view || !m_pageReady || !m_settings.syncSelection)
+        return;
+    int l1 = 0, l2 = 0;
+    if (!editorSelectionLines(&l1, &l2)) {
+        if (m_lastSelL1 != 0 || m_lastSelL2 != 0) {
+            m_lastSelL1 = 0;
+            m_lastSelL2 = 0;
+            m_view->ExecuteScript(L"window.mdHighlight && window.mdHighlight(0,0);", nullptr);
+        }
+        return;
+    }
+    if (l1 == m_lastSelL1 && l2 == m_lastSelL2)
+        return;
+    m_lastSelL1 = l1;
+    m_lastSelL2 = l2;
+    const QString js = QStringLiteral("window.mdHighlight && window.mdHighlight(%1,%2);").arg(l1).arg(l2);
+    m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), nullptr);
+}
+
+// 预览里选了内容 -> 编辑区选中对应的行
+void MdViewPanel::onWebSelection(int l1, int l2)
+{
+    if (!m_settings.syncSelection || l1 <= 0 || l2 < l1)
+        return;
+    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
+        return;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now < m_scrollSuppressUntil)
+        return;
+    int start = 0, end = 0;
+    __try {
+        start = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                              SCI_POSITIONFROMLINE, (unsigned long)(l1 - 1), 0);
+        end = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                            SCI_POSITIONFROMLINE, (unsigned long)l2, 0) - 1;
+        if (end < start) end = start;
+        m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                 SCI_SETSEL, (unsigned long)start, (long)end);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
+    m_scrollSuppressUntil = now + 250;
+    qWarning() << "[ndd-mdview] 选区同步: 网页行 " << l1 << ".." << l2 << " -> 编辑区选中";
 }
 
 void MdViewPanel::onEditorTextChanged()
@@ -1111,35 +1275,17 @@ void MdViewPanel::refreshNow()
 
 QString MdViewPanel::buildHtml(const QString& mdJs) const
 {
-    // 注意：markdown-it.min.js 直接内联进 <script>，
-    // 官方构建里不含 "</script>" 字面量，安全。
+    // 排版用现成的 github-markdown.css（MIT，sindresorhus），
+    // 自己只补一点滚动条 / 选区高亮 / 公式的微调。
     static const char* kCss =
-        "html,body{margin:0;padding:0;}"
-        "body{font-family:'Microsoft YaHei','Segoe UI',system-ui,sans-serif;"
-        "font-size:14px;line-height:1.7;color:#24292f;background:#ffffff;}"
-        "#md{max-width:900px;margin:0 auto;padding:20px 24px 60px 24px;"
-        "box-sizing:border-box;word-wrap:break-word;}"
-        "#md h1,#md h2,#md h3,#md h4,#md h5,#md h6{margin:1.2em 0 .6em 0;"
-        "font-weight:600;line-height:1.3;}"
-        "#md h1{font-size:1.9em;border-bottom:1px solid #d8dee4;padding-bottom:.3em;}"
-        "#md h2{font-size:1.5em;border-bottom:1px solid #d8dee4;padding-bottom:.3em;}"
-        "#md h3{font-size:1.25em;} #md h4{font-size:1.05em;}"
-        "#md p{margin:.6em 0;}"
-        "#md a{color:#0969da;text-decoration:none;} #md a:hover{text-decoration:underline;}"
-        "#md code{background:#eff1f3;padding:.15em .35em;border-radius:4px;"
-        "font-family:Consolas,'Courier New',monospace;font-size:.92em;}"
-        "#md pre{background:#f6f8fa;padding:14px 16px;border-radius:6px;overflow:auto;"
-        "border:1px solid #e5e7eb;}"
-        "#md pre code{background:none;padding:0;font-size:1em;line-height:1.5;}"
-        "#md blockquote{margin:.8em 0;padding:.2em 1em;color:#57606a;"
-        "border-left:4px solid #d0d7de;background:#f8f9fb;}"
-        "#md table{border-collapse:collapse;margin:1em 0;display:block;overflow:auto;}"
-        "#md th,#md td{border:1px solid #d0d7de;padding:6px 13px;}"
-        "#md th{background:#f6f8fa;font-weight:600;}"
-        "#md ul,#md ol{padding-left:2em;margin:.6em 0;}"
-        "#md li{margin:.2em 0;}"
-        "#md img{max-width:100%;}"
-        "#md hr{border:none;border-top:1px solid #d8dee4;margin:1.6em 0;}"
+        "html,body{margin:0;padding:0;background:#fff;}"
+        "body{font-family:'Microsoft YaHei','Segoe UI',system-ui,sans-serif;}"
+        "#md{padding:24px 32px 80px 32px;box-sizing:border-box;word-wrap:break-word;}"
+        "#md::-webkit-scrollbar{width:10px;}"
+        "#md::-webkit-scrollbar-thumb{background:#c8c8c8;border-radius:5px;}"
+        /* 选区高亮（编辑区选过来的） */
+        "#md .md-sel{background:#fff3c4 !important;border-radius:3px;"
+        "box-shadow:0 0 0 2px #fff3c4;}"
         /* 公式：KaTeX 排版需要，允许横向滚动 */
         "#md .katex-display{margin:1em 0;overflow-x:auto;overflow-y:hidden;}"
         "#md .katex{font-size:1.05em;}"
@@ -1147,7 +1293,7 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "#md .katex .mord.text,#md .katex .text{font-family:inherit;}"
         /* 公式语法错误时退回显示原始 LaTeX */
         "#md code.md-math-error{color:#b42318;background:#fff5f5;"
-        "border:1px solid #f3c0c0;white-space:pre-wrap;}";
+        "border:1px solid #f3c0c0;padding:2px 4px;border-radius:4px;}";
 
     // JS 侧：window.mdRender(text) -> 渲染
     static const char* kApi =
@@ -1158,8 +1304,9 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "    try { md.use(window.mdviewMath, {throwOnError:false,strict:false,trust:false}); }"
         "    catch(e) { console.log('math plugin failed', e); }"
         "  }"
-        /* 给块级元素加 data-line：markdown-it 的 block token 带 token.map（0 基行号），
-           有了它就能做「编辑区行号 <-> 预览位置」的精确滚动同步。 */
+        /* 给块级元素加 data-line / data-line2：markdown-it 的 block token 带
+           token.map（起止行号），有了它就能做「编辑区 <-> 预览」的
+           滚动同步与选区高亮。 */
         "  (function(){"
         "    var names = ['paragraph_open','heading_open','blockquote_open',"
         "'list_item_open','table_open','tr_open','fence','code_block','hr',"
@@ -1173,9 +1320,9 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "          var html = orig ? orig(tokens, idx, opts, env, self)"
         "                           : self.renderToken(tokens, idx, opts);"
         "          if (token && token.map) {"
-        "            var line = token.map[0] + 1;"
+        "            var s = token.map[0] + 1, e = token.map[1] + 1;"
         "            html = html.replace(/^<([a-zA-Z][a-zA-Z0-9]*)/,"
-        "                             '<$1 data-line=\"' + line + '\"');"
+        "                             '<$1 data-line=\"' + s + '\" data-line2=\"' + e + '\"');"
         "          }"
         "          return html;"
         "        };"
@@ -1225,6 +1372,32 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "    }"
         "    return line;"
         "  };"
+        /* --- 选区同步 --- */
+        /* 编辑区选中了 s..e 行 -> 高亮预览里相交的块 */
+        "  window.mdHighlight = function(s, e){"
+        "    var els = lineEls(), i, a, b, hit;"
+        "    for (i = 0; i < els.length; i++){"
+        "      a = parseInt(els[i].getAttribute('data-line'), 10);"
+        "      b = parseInt(els[i].getAttribute('data-line2'), 10) || a;"
+        "      hit = (a <= e && b >= s);"
+        "      if (hit) { els[i].classList.add('md-sel'); }"
+        "      else { els[i].classList.remove('md-sel'); }"
+        "    }"
+        "  };"
+        /* 预览里选中了内容 -> 返回对应的行号区间 */
+        "  window.mdSelectionLines = function(){"
+        "    var sel = window.getSelection();"
+        "    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { return null; }"
+        "    var range = sel.getRangeAt(0), els = lineEls(), i, el, s = null, e = null;"
+        "    for (i = 0; i < els.length; i++){"
+        "      el = els[i];"
+        "      if (el.contains(range.startContainer) || el.contains(range.endContainer)){"
+        "        if (s === null){ s = parseInt(el.getAttribute('data-line'), 10); }"
+        "        e = parseInt(el.getAttribute('data-line2'), 10) || s;"
+        "      }"
+        "    }"
+        "    return (s === null) ? null : (s + ',' + e);"
+        "  };"
         /* 能不能用原生消息通道（宿主 PostWebMessageAsString）？
            页面加载完宿主会问一句 window.mdvSupportsPost，
            答 1 就走原生通道（省掉 base64 编码和三次拷贝），
@@ -1246,17 +1419,31 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "        try { window.chrome.webview.postMessage('L' + window.mdCurrentLine()); }"
         "        catch(e){}"
         "      }, {passive:true});"
+        /* 预览里选中内容 -> 通知宿主（150ms 节流） */
+        "      var lastSel = 0;"
+        "      document.addEventListener('selectionchange', function(){"
+        "        var now = Date.now();"
+        "        if (now - lastSel < 150) { return; }"
+        "        lastSel = now;"
+        "        var lines = window.mdSelectionLines();"
+        "        if (lines){"
+        "          try { window.chrome.webview.postMessage('S' + lines); } catch(e){}"
+        "        }"
+        "      });"
         "    }"
         "  }catch(e){ window.mdvSupportsPost = false; }"
         "})();";
 
-    // KaTeX 资源：js/css 从虚拟主机 https://mdview.local/ 取，
-    // 公式插件（我们自己的）直接内联。
+    // 样式表：github-markdown.css（现成的成熟排版）+ KaTeX 的 css（开公式时）
     QString katexHead;
     QString katexTail;
+    katexHead = QStringLiteral(
+        "<link rel=\"stylesheet\" href=\"https://mdview.local/github-markdown.css\">");
     if (m_settings.katex) {
-        katexHead = QStringLiteral(
+        katexHead += QStringLiteral(
             "<link rel=\"stylesheet\" href=\"https://mdview.local/katex.min.css\">");
+    }
+    if (m_settings.katex) {
         katexTail = QStringLiteral(
             "<script src=\"https://mdview.local/katex.min.js\"></script>");
         QFile mf(QString::fromLatin1(kMathPluginResource));
@@ -1277,7 +1464,7 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
     html += QStringLiteral("<style>");
     html += QString::fromUtf8(kCss);
     html += QStringLiteral("</style></head><body>");
-    html += QStringLiteral("<div id=\"md\"></div>");
+    html += QStringLiteral("<div id=\"md\" class=\"markdown-body\"></div>");
     html += QStringLiteral("<script>");
     html += mdJs;
     html += QStringLiteral("</script>");
@@ -1388,21 +1575,20 @@ void MdViewPanel::navigateToApp()
     if (!m_view)
         return;
 
-    // KaTeX 资源：解包到 %TEMP%，再用虚拟主机映射暴露给网页
-    if (m_settings.katex) {
+    // 网页资源（github-markdown.css / KaTeX）：解包到 %TEMP%，再用虚拟主机映射暴露
+    {
         QString err;
-        if (!ExtractKatexAssets(&err)) {
-            qWarning() << "[ndd-mdview]" << err << "（公式渲染不可用）";
-        } else {
-            ComPtr<ICoreWebView2_3> view3;
-            if (SUCCEEDED(m_view.As(&view3)) && view3) {
-                HRESULT hr = view3->SetVirtualHostNameToFolderMapping(
-                    L"mdview.local",
-                    reinterpret_cast<LPCWSTR>(KatexAssetDir().toStdWString().c_str()),
-                    COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
-                if (FAILED(hr))
-                    qWarning() << "[ndd-mdview] 虚拟主机映射失败, hr=0x" << (quint32)hr;
-            }
+        if (!ExtractWebAssets(m_settings.katex, &err)) {
+            qWarning() << "[ndd-mdview]" << err;
+        }
+        ComPtr<ICoreWebView2_3> view3;
+        if (SUCCEEDED(m_view.As(&view3)) && view3) {
+            HRESULT hr = view3->SetVirtualHostNameToFolderMapping(
+                L"mdview.local",
+                reinterpret_cast<LPCWSTR>(WebAssetDir().toStdWString().c_str()),
+                COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+            if (FAILED(hr))
+                qWarning() << "[ndd-mdview] 虚拟主机映射失败, hr=0x" << (quint32)hr;
         }
     }
 
@@ -1466,13 +1652,18 @@ void MdViewPanel::navigateToApp()
     navHandler->Release();
     (void)hr;
 
-    // 网页 -> 宿主的滚动通知（预览滚动时告诉宿主当前行号）
+    // 网页 -> 宿主的滚动/选区通知
     EventRegistrationToken msgToken;
     WebMessageHandler* msgHandler = new WebMessageHandler([self](const QString& s) {
         if (!self)
             return;
-        if (s.startsWith(QLatin1Char('L')))
+        if (s.startsWith(QLatin1Char('L'))) {
             self->onWebScroll(s.mid(1).toInt());
+        } else if (s.startsWith(QLatin1Char('S'))) {
+            const QStringList p = s.mid(1).split(QLatin1Char(','));
+            if (p.size() == 2)
+                self->onWebSelection(p.at(0).toInt(), p.at(1).toInt());
+        }
     });
     m_view->add_WebMessageReceived(msgHandler, &msgToken);
     msgHandler->Release();
@@ -1523,7 +1714,7 @@ void MdViewPanel::pushCurrentText()
     if (m_currentText == m_lastText)
         return;
     m_lastText = m_currentText;
-    setStatus(QStringLiteral("实时 | %1 字符").arg(m_currentText.size()));
+    updateTitle();
 
     // 渲染统计（节流到 2 秒一次）：既是诊断信息，也方便确认公式渲染是否生效
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -1894,10 +2085,8 @@ public:
     void applySettings()
     {
         settings.save();
-        if (panel) {
-            panel->setSettings(settings);
-            panel->reloadPage();
-        }
+        if (panel)
+            panel->applySettings(settings);
     }
 };
 
@@ -1986,12 +2175,24 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
                 return;
             ctl->settings.refreshMode = mode;
             ctl->applySettings();
-            if (ctl->panel) {
-                // 切换模式要重建定时器策略
-                ctl->panel->setSettings(ctl->settings);
-            }
         });
     }
+
+    QAction* actSyncScroll = menu->addAction(QStringLiteral("滚动同步"));
+    actSyncScroll->setCheckable(true);
+    actSyncScroll->setChecked(ctl->settings.syncScroll);
+    QObject::connect(actSyncScroll, &QAction::triggered, ctl, [ctl, actSyncScroll]() {
+        ctl->settings.syncScroll = actSyncScroll->isChecked();
+        ctl->applySettings();
+    });
+
+    QAction* actSyncSel = menu->addAction(QStringLiteral("选区同步"));
+    actSyncSel->setCheckable(true);
+    actSyncSel->setChecked(ctl->settings.syncSelection);
+    QObject::connect(actSyncSel, &QAction::triggered, ctl, [ctl, actSyncSel]() {
+        ctl->settings.syncSelection = actSyncSel->isChecked();
+        ctl->applySettings();
+    });
 
     QAction* actKatex = menu->addAction(QStringLiteral("公式渲染 (KaTeX)"));
     actKatex->setCheckable(true);

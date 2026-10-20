@@ -2,5 +2,6 @@
     <qresource prefix="/mdview">
         <file alias="markdown-it.min.js">markdown-it.min.js</file>
         <file alias="mdview-math.js">mdview-math.js</file>
+        <file alias="github-markdown.css">github-markdown.css</file>
     </qresource>
 </RCC>
