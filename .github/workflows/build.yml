@@ -42,45 +42,23 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # KaTeX（公式渲染）+ markdown-it-katex（markdown-it 的 $...$ 插件）
-          # 版本钉死，保证可复现。
+          # KaTeX（公式渲染用的排版引擎）。版本钉死，保证可复现。
+          # 公式的 markdown-it 插件是我们自己写的（assets/mdview-math.js），
+          # 已经在仓库里，这里只需要 KaTeX 本体 + 字体。
           New-Item -ItemType Directory -Force -Path 'assets\fonts' | Out-Null
           New-Item -ItemType Directory -Force -Path 'katex_pkg' | Out-Null
-          New-Item -ItemType Directory -Force -Path 'mdit_pkg' | Out-Null
           Push-Location 'katex_pkg'
           npm pack katex@0.16.11 | Out-Null
           Pop-Location
-          Push-Location 'mdit_pkg'
-          npm pack markdown-it-katex@2.0.3 | Out-Null
-          Pop-Location
           $k = Get-ChildItem 'katex_pkg' -Filter '*.tgz' | Select-Object -First 1
           tar -xzf $k.FullName -C 'katex_pkg'
-          $m = Get-ChildItem 'mdit_pkg' -Filter '*.tgz' | Select-Object -First 1
-          tar -xzf $m.FullName -C 'mdit_pkg'
           Copy-Item 'katex_pkg\package\dist\katex.min.js' 'assets\'
           Copy-Item 'katex_pkg\package\dist\katex.min.css' 'assets\'
           Copy-Item 'katex_pkg\package\dist\fonts\*.woff2' 'assets\fonts\'
 
-          # markdown-it-katex 是 CommonJS 模块，套一层浏览器 shim：
-          #   require('katex') -> window.katex
-          $shim = @"
-(function(){
-  function require(name){
-    if (name === 'katex') { return window.katex; }
-    throw new Error('unknown module: ' + name);
-  }
-  var module = { exports: {} };
-  var exports = module.exports;
-  __BODY__
-  window.markdownitKatex = module.exports;
-})();
-"@
-          $body = Get-Content 'mdit_pkg\package\index.js' -Raw
-          $shim.Replace('__BODY__', $body) | Set-Content 'assets\markdown-it-katex.js' -Encoding utf8
-
           # 生成 KaTeX 资源的 qrc（字体用 alias 指到 fonts/）
           $qrc = "<RCC>`n  <qresource prefix=`"/mdview`">`n"
-          foreach ($f in @('katex.min.js','katex.min.css','markdown-it-katex.js')) {
+          foreach ($f in @('katex.min.js','katex.min.css')) {
             $qrc += "    <file alias=`"$f`">$f</file>`n"
           }
           foreach ($f in (Get-ChildItem 'assets\fonts' -Filter '*.woff2' | Sort-Object Name)) {

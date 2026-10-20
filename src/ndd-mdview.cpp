@@ -403,9 +403,9 @@ static void TakeTextFromSlot(void* slot, QString* out)
 //  好处：字体按需加载（不会 20 个字体全进内存）、页面本体很小。
 // ===========================================================================
 static const char* kMarkdownItResource = ":/mdview/markdown-it.min.js";
+static const char* kMathPluginResource = ":/mdview/mdview-math.js";
 static const char* kKatexJsResource    = ":/mdview/katex.min.js";
 static const char* kKatexCssResource   = ":/mdview/katex.min.css";
-static const char* kKatexPluginResource = ":/mdview/markdown-it-katex.js";
 static const char* kKatexFontResource  = ":/mdview/fonts/";
 static const char* kKatexMarker        = "assets.ok";
 
@@ -459,8 +459,7 @@ static bool ExtractKatexAssets(QString* err)
     }
 
     if (!WriteResourceToFile(QString::fromLatin1(kKatexJsResource), d.filePath(QStringLiteral("katex.min.js")))
-        || !WriteResourceToFile(QString::fromLatin1(kKatexCssResource), d.filePath(QStringLiteral("katex.min.css")))
-        || !WriteResourceToFile(QString::fromLatin1(kKatexPluginResource), d.filePath(QStringLiteral("markdown-it-katex.js"))) ) {
+        || !WriteResourceToFile(QString::fromLatin1(kKatexCssResource), d.filePath(QStringLiteral("katex.min.css"))) ) {
         *err = QStringLiteral("解包 KaTeX 脚本失败");
         return false;
     }
@@ -894,16 +893,19 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "#md .katex-display{margin:1em 0;overflow-x:auto;overflow-y:hidden;}"
         "#md .katex{font-size:1.05em;}"
         /* 公式里夹中文：KaTeX 自带字体没有汉字，靠浏览器逐字回退 */
-        "#md .katex .mord.text,#md .katex .text{font-family:inherit;}";
+        "#md .katex .mord.text,#md .katex .text{font-family:inherit;}"
+        /* 公式语法错误时退回显示原始 LaTeX */
+        "#md code.md-math-error{color:#b42318;background:#fff5f5;"
+        "border:1px solid #f3c0c0;white-space:pre-wrap;}";
 
-    // JS 侧：window.mdUpdate(text) -> 渲染
+    // JS 侧：window.mdRender(text) -> 渲染
     static const char* kApi =
         "(function(){"
         "  var md = window.markdownit({html:false,linkify:true,breaks:false,"
         "typographer:false,xhtmlOut:false});"
-        "  if (window.katex && window.markdownitKatex) {"
-        "    try { md.use(window.markdownitKatex({throwOnError:false,strict:false,trust:false})); }"
-        "    catch(e) { console.log('katex plugin failed', e); }"
+        "  if (window.katex && window.mdviewMath) {"
+        "    try { md.use(window.mdviewMath, {throwOnError:false,strict:false,trust:false}); }"
+        "    catch(e) { console.log('math plugin failed', e); }"
         "  }"
         "  window.mdRender = function(text){"
         "    try{"
@@ -925,17 +927,23 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "  };"
         "})();";
 
-    // KaTeX 资源（从虚拟主机 https://mdview.local/ 取）
+    // KaTeX 资源：js/css 从虚拟主机 https://mdview.local/ 取，
+    // 公式插件（我们自己的）直接内联。
     QString katexHead;
+    QString katexTail;
     if (m_settings.katex) {
         katexHead = QStringLiteral(
             "<link rel=\"stylesheet\" href=\"https://mdview.local/katex.min.css\">");
-    }
-    QString katexTail;
-    if (m_settings.katex) {
         katexTail = QStringLiteral(
-            "<script src=\"https://mdview.local/katex.min.js\"></script>"
-            "<script src=\"https://mdview.local/markdown-it-katex.js\"></script>");
+            "<script src=\"https://mdview.local/katex.min.js\"></script>");
+        QFile mf(QString::fromLatin1(kMathPluginResource));
+        if (mf.open(QIODevice::ReadOnly)) {
+            katexTail += QStringLiteral("<script>");
+            katexTail += QString::fromUtf8(mf.readAll());
+            katexTail += QStringLiteral("</script>");
+        } else {
+            qWarning() << "[ndd-mdview] 找不到公式插件资源，公式渲染不可用";
+        }
     }
 
     QString html;
