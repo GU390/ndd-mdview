@@ -17,6 +17,8 @@
   标题层级、水平线 —— 全部由 [markdown-it 14.1.0](https://github.com/markdown-it/markdown-it) 渲染。
 - **公式渲染**：`$...$` 行内公式和 `$$...$$` 块级公式，用
   [KaTeX 0.16.11](https://katex.org) 排版；公式里夹中文也能正常显示。
+- **滚动同步**：拖动编辑区的滚动条，右侧预览跟着滚到同一段内容；
+  反过来滚预览，编辑区也会跟着走。
 - **省内存**：隐藏面板时可释放 WebView2（省约 120 MB），再次打开自动重建。
 - **样式干净**：类 GitHub 的浅色排版，中文友好（微软雅黑）。
 - **不链接 qscint**：取文本只借宿主导出的一个符号，不引入 qscintilla 的类布局依赖（见下）。
@@ -60,6 +62,7 @@
 | `NDD_MDVIEW_AUTOSHOW=1` | 启动 3 秒后自动打开预览面板 |
 | `NDD_MDVIEW_AUTOHIDE=1` | 启动 10 秒后自动隐藏面板（用来验证释放内存那条路径） |
 | `NDD_MDVIEW_TESTTYPE=1` | 启动 6 秒后往编辑区注入一个 `Z` 键（用来验证「改字→预览更新」链路，会真的改到文档里） |
+| `NDD_MDVIEW_TESTSYNC=1` | 启动 8 秒后自测滚动同步（把编辑区滚到第 40 行，再读回网页当前行号） |
 
 ## 性能实测
 
@@ -151,6 +154,32 @@ mov rax, r14          ; 返回槽地址放 RAX
 用 base64：编辑区文本先转 UTF-8，再 base64，注入
 `window.mdUpdate('...')`。base64 只含 `A-Za-z0-9+/=`，
 不用跟 JS 字符串转义规则较劲。JS 侧 `atob` + `TextDecoder('utf-8')` 解回来。
+
+### 滚动同步怎么做的
+
+两边靠**行号**对齐，不是按比例：
+
+1. markdown-it 的块级 token 带 `token.map`（行号），渲染时给每个块级元素
+   加一个 `data-line="N"`（源码行号，1 基）。
+2. 编辑区的滚动位置用 qscintilla 导出的两个高层 API 读写：
+   ```
+   ?firstVisibleLine@QsciScintilla@@QEBAHXZ      ← int  firstVisibleLine() const
+   ?setFirstVisibleLine@QsciScintilla@@QEAAXH@Z  ← void setFirstVisibleLine(int)
+   ```
+   ⚠️ **别去用 `QAbstractScrollArea` 那个 QScrollBar** —— QScintilla 并不用它，
+   实测 `setValue()` 改了值但编辑区根本不滚（而且那个滚动条的值会自己乱跳）。
+   `SCI_LINESCROLLTO` QScintilla 也没实现，同样无效。
+3. 编辑区首行变了 → 调网页的 `window.mdScrollToLine(行号)`，
+   找到 `data-line <= 行号` 里最大的那个块，滚到它的顶部。
+4. 反方向：网页滚动时用 `window.chrome.webview.postMessage('L'+行号)` 通知宿主，
+   宿主再调 `setFirstVisibleLine()` 滚编辑区。
+5. 双向都会回声，所以同步时置一个 250 ms 的抑制窗口，避免来回抖。
+
+**粒度是「块」**：编辑区第 40 行如果落在从第 14 行开始的那一段里，
+预览会滚到那段的开头 —— 和 Typora / Obsidian 的行为一致。
+
+检测编辑区滚动用 100 ms 轮询一次「首行」（只读一个 int，不是复制整篇文档），
+所以开着不动时 CPU 仍然是 0.00%。
 
 ### 公式渲染（KaTeX）
 
