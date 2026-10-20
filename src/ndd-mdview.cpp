@@ -62,6 +62,7 @@
 #include <QResizeEvent>
 #include <QDebug>
 #include <QDateTime>
+#include <QKeyEvent>
 
 #include <functional>
 #include <vector>
@@ -1765,6 +1766,23 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
         QTimer::singleShot(10000, ctl, [ctl]() {
             if (ctl->dock)
                 ctl->dock->hide();
+        });
+    }
+
+    // 环境变量注入一个按键：NDD_MDVIEW_TESTTYPE=1
+    // 用来验证「改字 → 事件驱动 → 预览更新」这条完整链路
+    if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTTYPE")) {
+        QTimer::singleShot(6000, ctl, [ctl]() {
+            QWidget* ed = FindCurrentEditor(ctl->host.data());
+            if (ed == nullptr) {
+                qWarning() << "[ndd-mdview] TESTTYPE: 没找到编辑区";
+                return;
+            }
+            qWarning() << "[ndd-mdview] TESTTYPE: 注入按键";
+            QKeyEvent press(QEvent::KeyPress, Qt::Key_Z, Qt::NoModifier, QStringLiteral("Z"));
+            QApplication::postEvent(ed, &press);
+            QKeyEvent release(QEvent::KeyRelease, Qt::Key_Z, Qt::NoModifier, QStringLiteral("Z"));
+            QApplication::postEvent(ed, &release);
         });
     }
 
