@@ -1,5 +1,0 @@
-<RCC>
-    <qresource prefix="/mdview">
-        <file alias="markdown-it.min.js">assets/markdown-it.min.js</file>
-    </qresource>
-</RCC>

@@ -20,8 +20,16 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 add_library(ndd-mdview SHARED
     src/ndd-mdview.cpp
     src/pluginGl.h
-    resources.qrc
 )
+
+# Qt 资源：assets/*.qrc
+#   ndd-mdview.qrc —— 仓库里自带的（markdown-it）
+#   katex.qrc      —— CI 生成的（KaTeX 的 js/css/字体）
+# 用 glob 是为了让 CI 生成的那份也能自动进来。
+file(GLOB NDD_QRC "${CMAKE_CURRENT_SOURCE_DIR}/assets/*.qrc")
+if(NDD_QRC)
+    target_sources(ndd-mdview PRIVATE ${NDD_QRC})
+endif()
 
 target_include_directories(ndd-mdview PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

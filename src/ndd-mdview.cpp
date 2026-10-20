@@ -6,28 +6,36 @@
 //  --------
 //  1) 宿主 ABI（src/pluginGl.h，与 Notepad-- v3.8.3 一致）：
 //       NDD_PROC_IDENTIFY : 扫描 plugin\*.dll 时调用，填名字/说明/版本
-//       NDD_PROC_MAIN     : 宿主建好一级 QAction 后调用，插件自己连 triggered
-//     宿主在 m_menuType==0 时会建 QAction 并塞进 pProcData->m_pAction；
-//     宿主那个 connect(pAction, triggered, onPlugWork) 在源码里是被注释掉的，
-//     所以必须由插件自己连。
+//       NDD_PROC_MAIN     : 宿主建好二级菜单后调用，插件往里塞自己的菜单项
+//     m_menuType==1 时宿主建二级菜单并把句柄塞进 pProcData->m_rootMenu，
+//     菜单项由插件自己加（见 ccnotepad.cpp 的 onPlugFound）。
 //
-//  2) 取编辑区文本走 **宿主导出的 QsciScintilla::text()**：
-//     - 宿主用 QScintilla，它的 Scintilla 那一侧是 QWidget（ScintillaQt），
-//       **没有**原生 "Scintilla" 窗口类（实测枚举主窗口全部子孙，只有
-//       Qt5152QWindowIcon 与 Chrome_*），SCI_GETTEXT 这类消息根本发不出去；
-//     - qscintilla 的符号宿主**全导出了**（qmyedit_qt5.dll 导出表 2403 项，
-//       含 ?text@QsciScintilla@@QEBA?AVQString@@XZ），宿主自己的 Markdown
-//       预览用的也是 pEditView->text()；
-//     - 于是只声明一个同名同签名的最小类 + GetProcAddress 拿真实地址，
-//       不链接 qscintilla、也不依赖它的类布局。详见下面「取文工具层」。
+//  2) 取编辑区文本 **不链接 qscint**：
+//     宿主把 qscintilla 静态链进 qmyedit_qt5.dll，符号全部导出（实测 2403 项），
+//     头文件不随插件分发，类布局跨版本还会变。
+//     所以只声明一个同名同签名的最小类，用 GetProcAddress 拿真实函数地址。
+//     ⚠️ 调用约定是**成员函数**那套：RCX=this、RDX=隐藏返回缓冲区
+//     （自由函数才是 RCX=返回槽、RDX=第一个实参）。搞反了就是崩宿主。
+//     详见下面「取文工具层」的注释。
 //
-//  3) 文本传输用 base64：避免 JSON/JS 字符串转义地狱；JS 侧 TextDecoder 解码。
+//  3) 文本直接用 PostWebMessageAsString 推给网页（不是 base64+ExecuteScript）：
+//     省掉 UTF-8 转换、base64 编码、JS 表达式拼装与再解析，每帧少三次大拷贝。
 //
 //  4) 面板用 QDockWidget 挂在主窗口右侧；宿主主窗口是 QMainWindow
 //     （CCNotePad : public QMainWindow），qobject_cast 判定。
 //     退化路径：不是 QMainWindow 时退化成独立顶层窗口。
 //
-//  5) 本文件不含 Q_OBJECT，Qt 的 moc 不需要跑。
+//  5) 更新策略：默认**事件驱动** —— 连编辑区的 textChanged() 信号，
+//     120ms 合并成一次推送；空闲时完全不轮询，CPU 归零。
+//     也可切成固定间隔轮询（用户可调），适合超大文件。
+//
+//  6) 公式渲染：KaTeX 0.16.11 + markdown-it-katex。
+//     KaTeX 的静态资源编译进 DLL，首次使用时解到 %TEMP%，
+//     再用 WebView2 的虚拟主机映射（https://mdview.local/）暴露给网页，
+//     字体按需加载，不会全进内存。
+//
+//  7) 本文件含 Q_OBJECT（MdViewPanel / MdController），moc 由 CMake AUTOMOC 生成，
+//     见文件末尾的 #include "ndd-mdview.moc"。
 // ============================================================================
 
 #include <QtGlobal>
@@ -35,6 +43,7 @@
 #include <QObject>
 #include <QApplication>
 #include <QAction>
+#include <QActionGroup>
 #include <QMenu>
 #include <QTimer>
 #include <QString>
@@ -45,7 +54,9 @@
 #include <QFileInfo>
 #include <QMainWindow>
 #include <QDockWidget>
+#include <QMessageBox>
 #include <QPointer>
+#include <QSettings>
 #include <QShowEvent>
 #include <QHideEvent>
 #include <QResizeEvent>
@@ -78,32 +89,50 @@ using Microsoft::WRL::ComPtr;
 #  define NDD_EXPORT __attribute__((visibility("default")))
 #endif
 
-// ---------------------------------------------------------------------------
-//  取文工具层：只用宿主导出的「纯 POD 参数/返回」的成员函数
-//
-//  宿主把 qscintilla 静态链进 qmyedit_qt5.dll，符号**全部导出**
-//  （实测导出表 2403 项）。但跨模块调它的 QString 返回值不可靠：
-//    第 1 版：调 QsciScintilla::text()（指针取自宿主给的 std::function）
-//             → 0xC0000005 崩在 qmyedit_qt5.dll 的 SendScintilla 入口；
-//    第 2 版：同样的 text()，指针改成从 Qt 对象树找（已确认指针是对的）
-//             → 0xC0000409（BEX64 栈/缓冲区溢出）崩在 Qt5Core 的消息输出路径。
-//  两次都指向「QString 跨模块按值返回」这条路在本机不可靠。
-//
-//  所以改用两个纯 POD 的导出成员，全程不跨模块返回任何 C++ 对象：
-//    ?isReadOnly@QsciScintilla@@QEBA_NXZ
-//        bool isReadOnly() const          → this=RCX，返回 AL（无 sret）
-//    ?SendScintilla@QsciScintillaBase@@QEBAJIKJ@Z
-//        long SendScintilla(unsigned int iMessage, unsigned long wParam,
-//                           long lParam) const
-//                                        → this=RCX，参数 EDX/R8D/R9D，返回 EAX
-//
-//  用 SendScintilla 发 SCI_GETLENGTH / SCI_GETTEXT / SCI_GETCODEPAGE，
-//  拿到原始字节后自己按文档编码解码。
-//
-//  另一个坑：SendScintilla 的 lParam 修饰名里是 J/K（32 位），
-//  指针有可能被截断 ⇒ 缓冲区必须落在 4GB 以下，
-//  用 VirtualAlloc 指定低地址申请。
-// ---------------------------------------------------------------------------
+// ===========================================================================
+//  设置（QSettings 持久化到 %APPDATA%\Notepad--\ndd-mdview.ini）
+// ===========================================================================
+
+// 自动更新模式：0=实时（事件驱动），其余是固定轮询间隔
+static const int kRefreshIntervals[] = { 0, 500, 1000, 2000, 5000 };
+static const int kRefreshModeCount = 5;
+static const char* kRefreshLabels[] = {
+    "实时（事件驱动）", "500 毫秒", "1 秒", "2 秒", "5 秒"
+};
+
+struct MdSettings
+{
+    int  refreshMode   = 0;    // 见 kRefreshIntervals
+    bool katex        = true;  // 公式渲染
+    bool releaseOnHide = true; // 隐藏面板时释放 WebView2 内存
+
+    static MdSettings load()
+    {
+        MdSettings s;
+        QSettings st(QSettings::IniFormat, QSettings::UserScope,
+                     QStringLiteral("Notepad--"), QStringLiteral("ndd-mdview"));
+        s.refreshMode = st.value(QStringLiteral("refreshMode"), 0).toInt();
+        if (s.refreshMode < 0 || s.refreshMode >= kRefreshModeCount)
+            s.refreshMode = 0;
+        s.katex = st.value(QStringLiteral("katex"), true).toBool();
+        s.releaseOnHide = st.value(QStringLiteral("releaseOnHide"), true).toBool();
+        return s;
+    }
+
+    void save() const
+    {
+        QSettings st(QSettings::IniFormat, QSettings::UserScope,
+                     QStringLiteral("Notepad--"), QStringLiteral("ndd-mdview"));
+        st.setValue(QStringLiteral("refreshMode"), refreshMode);
+        st.setValue(QStringLiteral("katex"), katex);
+        st.setValue(QStringLiteral("releaseOnHide"), releaseOnHide);
+        st.sync();
+    }
+};
+
+// ===========================================================================
+//  取文工具层
+// ===========================================================================
 
 // ABI 签名要求 std::function<QsciScintilla*(QWidget*)>，这里的名字必须
 // 与宿主一致（模板实参只用到指针类型，名字不影响 ABI）。
@@ -114,25 +143,19 @@ public:
 
 // this=RCX，返回 bool（AL）
 typedef bool (*SciBoolFn)(QsciScintilla* self);
-// this=RCX，返回 int（EAX）
-typedef int (*SciIntFn)(QsciScintilla* self);
 // this=RCX，参数 EDX/R8D/R9D，返回 long（EAX）
 typedef long (*SciSendFn)(QsciScintilla* self, unsigned int msg,
                           unsigned long wParam, long lParam);
-// sret 槽在 RDX，this 在 RCX。
-//
-// ⚠️ 这是**成员函数**的规则，不是自由函数的！MSVC x64 里：
-//   自由函数返回类类型 → RCX=隐藏返回缓冲区，RDX=第一个实参
-//   成员函数返回类类型 → RCX=this，RDX=隐藏返回缓冲区
-// 用 capstone dump qmyedit_qt5.dll 的 text() 机器码核对过：
-//   mov r14, rdx        ; 取回入口 RDX（返回槽）
-//   mov rbp, rcx        ; 存入口 RCX（this）
-//   call SendScintilla  ; RCX 未改 —— SendScintilla 内部 mov rcx,[rcx+30]，
-//                        ; 所以 RCX 必须是 this
-//   ...
-//   mov rax, r14        ; 返回槽地址放 RAX
-// 一开始按自由函数的规则写（RCX=槽、RDX=this）→ 被调方把返回槽当 this
-// 解引用 [rcx+0x30] → 越界访问违例 → 被 SEH 吞掉 → 静默走了读文件的兜底。
+// ⚠️ 成员函数按值返回类类型时：**RCX=this，RDX=隐藏返回缓冲区**
+//    （自由函数才是 RCX=返回槽、RDX=第一个实参）。
+//    用 capstone dump qmyedit_qt5.dll 的 text() 机器码核对过：
+//      mov r14, rdx        ; 取回入口 RDX（返回槽）
+//      mov rbp, rcx        ; 存入口 RCX（this）
+//      call SendScintilla  ; RCX 未改 —— 它内部 mov rcx,[rcx+30]，
+//                           ; 所以 RCX 必须是 this
+//      mov rax, r14        ; 返回槽地址放 RAX
+//    一开始按自由函数的规则写（RCX=槽、RDX=this）→ 被调方把返回槽当 this
+//    解引用 [rcx+0x30] → 越界访问违例 → 被 SEH 吞掉 → 静默走了读文件兜底。
 typedef void (*SciTextFn)(void* self, void* retSlot);
 
 // 宿主 qscintilla 那个 DLL 里的修饰名
@@ -193,34 +216,26 @@ static void* ResolveExport(const char* symbol)
 // ---------------------------------------------------------------------------
 //  定位当前编辑区
 //
-//  为什么不直接用宿主给的 getCurEdit 仿函数：
-//    实测（v1.0 第一版）用它拿到的指针是垃圾，调用 text() 直接在
-//    qmyedit_qt5.dll 的 SendScintilla 里访问违例（0xc0000005，崩宿主）。
-//    寄存器约定已用机器码核对过是对的（sret=RCX / this=RDX），
-//    所以问题出在那个指针本身 —— 跨模块 std::function 的可靠性存疑，
-//    不敢再依赖。
-//
-//  改用 Qt 自己的对象树定位：宿主主窗口 → findChildren<QWidget*>() →
-//  用 metaObject()->className() 认 "ScintillaEditView"。
-//  这条路全是 Qt 自己的 API（metaObject 是虚函数，vtable 在宿主 EXE 里，
-//  调用完全安全）。
+//  两个来源互相印证：
+//   1) 宿主 ABI 里的 getCurEdit 仿函数（返回 QsciScintilla*）
+//   2) Qt 对象树：findChildren<QWidget*> + metaObject()->className()
+//      —— 优先选祖先里有 QTabWidget 的那个（宿主主编辑区是 ui.editTabWidget 的页，
+//      别处也可能藏着 ScintillaEditView）
 //
 //  关键前提：ScintillaEditView : QsciScintilla : QsciScintillaBase
 //  : QAbstractScrollArea : QFrame : QWidget : QObject —— 全是单继承，
-//  所以 **所有基类子对象的偏移都是 0**：
-//  QWidget* == QsciScintilla* == 同一个地址。
-//  于是拿 QWidget* 直接当 QsciScintilla* 传给 SendScintilla 是对的。
+//  所以 **所有基类子对象的偏移都是 0**：QWidget* == QsciScintilla*。
 // ---------------------------------------------------------------------------
-// 祖先里有没有 QTabWidget —— 宿主的主编辑区是 ui.editTabWidget 的页，
-// 别处（比如查找结果面板）也可能藏着 ScintillaEditView，要认准这个。
-static bool HasTabAncestor(QWidget* w)
+
+// 往上找第一个 QTabWidget 祖先（找不到返回 nullptr）
+static QWidget* FindTabAncestor(QWidget* w)
 {
     for (QWidget* p = w ? w->parentWidget() : nullptr; p; p = p->parentWidget()) {
         const QMetaObject* mo = p->metaObject();
         if (mo && qstrcmp(mo->className(), "QTabWidget") == 0)
-            return true;
+            return p;
     }
-    return false;
+    return nullptr;
 }
 
 static QWidget* FindCurrentEditor(QWidget* host)
@@ -248,7 +263,7 @@ static QWidget* FindCurrentEditor(QWidget* host)
         const QRect r = w->rect();
         const long area = (long)r.width() * (long)r.height();
 
-        if (HasTabAncestor(w)) {
+        if (FindTabAncestor(w)) {
             if (area > bestTabArea) {
                 bestTabArea = area;
                 bestTab = w;
@@ -380,11 +395,83 @@ static void TakeTextFromSlot(void* slot, QString* out)
     q->~QString();          // 释放槽里那个
 }
 
-// 轮询间隔（毫秒）
-static const int kPollIntervalMs = 250;
-
-// markdown-it 资源路径（见 resources.qrc）
+// ===========================================================================
+//  静态资源：KaTeX 解到 %TEMP%
+//
+//  KaTeX 的 js/css/字体编译进 DLL（Qt 资源），首次使用时解到临时目录，
+//  再用 WebView2 的虚拟主机映射暴露给网页。
+//  好处：字体按需加载（不会 20 个字体全进内存）、页面本体很小。
+// ===========================================================================
 static const char* kMarkdownItResource = ":/mdview/markdown-it.min.js";
+static const char* kKatexJsResource    = ":/mdview/katex.min.js";
+static const char* kKatexCssResource   = ":/mdview/katex.min.css";
+static const char* kKatexPluginResource = ":/mdview/markdown-it-katex.js";
+static const char* kKatexFontResource  = ":/mdview/fonts/";
+static const char* kKatexMarker        = "assets.ok";
+
+// 临时目录：%TEMP%\ndd-mdview\katex-0.16.11
+static QString KatexAssetDir()
+{
+    return QDir(QDir::tempPath())
+        .filePath(QStringLiteral("ndd-mdview") + QDir::separator()
+                  + QStringLiteral("katex-0.16.11"));
+}
+
+// 把一个资源写成文件
+static bool WriteResourceToFile(const QString& resPath, const QString& filePath)
+{
+    QFile f(resPath);
+    if (!f.open(QIODevice::ReadOnly))
+        return false;
+    QFile out(filePath);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+    out.write(f.readAll());
+    out.close();
+    return true;
+}
+
+// 解包 KaTeX 资源（幂等：靠标记文件判断是否已解过）
+static bool ExtractKatexAssets(QString* err)
+{
+    const QString dir = KatexAssetDir();
+    QDir d(dir);
+    if (!d.exists() && !d.mkpath(QStringLiteral("."))) {
+        *err = QStringLiteral("无法创建临时目录：%1").arg(dir);
+        return false;
+    }
+
+    const QString marker = d.filePath(QStringLiteral("assets.ok"));
+    if (QFile::exists(marker))
+        return true;
+
+    // 字体
+    const QString fontDir = d.filePath(QStringLiteral("fonts"));
+    QDir().mkpath(fontDir);
+    QDir res(QStringLiteral(":/mdview/fonts"));
+    const QStringList fonts = res.entryList(QDir::Files);
+    for (int i = 0; i < fonts.size(); ++i) {
+        if (!WriteResourceToFile(QStringLiteral(":/mdview/fonts/") + fonts.at(i),
+                                 d.filePath(QStringLiteral("fonts/") + fonts.at(i)))) {
+            *err = QStringLiteral("解包字体失败：%1").arg(fonts.at(i));
+            return false;
+        }
+    }
+
+    if (!WriteResourceToFile(QString::fromLatin1(kKatexJsResource), d.filePath(QStringLiteral("katex.min.js")))
+        || !WriteResourceToFile(QString::fromLatin1(kKatexCssResource), d.filePath(QStringLiteral("katex.min.css")))
+        || !WriteResourceToFile(QString::fromLatin1(kKatexPluginResource), d.filePath(QStringLiteral("markdown-it-katex.js"))) ) {
+        *err = QStringLiteral("解包 KaTeX 脚本失败");
+        return false;
+    }
+
+    QFile m(marker);
+    if (m.open(QIODevice::WriteOnly)) {
+        m.write("ok\n");
+        m.close();
+    }
+    return true;
+}
 
 // ===========================================================================
 //  手写 COM 回调对象
@@ -532,57 +619,12 @@ private:
     long m_ref = 1;
 };
 
-class ExecScriptHandler final
-    : public ICoreWebView2ExecuteScriptCompletedHandler
-{
-public:
-    typedef std::function<void(HRESULT, LPCWSTR)> Fn;
-
-    explicit ExecScriptHandler(Fn fn) : m_fn(std::move(fn)) {}
-
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
-    {
-        if (ppv == nullptr)
-            return E_POINTER;
-        if (riid == __uuidof(IUnknown) ||
-            riid == __uuidof(ICoreWebView2ExecuteScriptCompletedHandler)) {
-            *ppv = static_cast<ICoreWebView2ExecuteScriptCompletedHandler*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-
-    ULONG STDMETHODCALLTYPE AddRef() override
-    {
-        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
-    }
-
-    ULONG STDMETHODCALLTYPE Release() override
-    {
-        ULONG n = static_cast<ULONG>(InterlockedDecrement(&m_ref));
-        if (n == 0)
-            delete this;
-        return n;
-    }
-
-    HRESULT STDMETHODCALLTYPE Invoke(HRESULT code, LPCWSTR result) override
-    {
-        m_fn(code, result);
-        return S_OK;
-    }
-
-private:
-    Fn m_fn;
-    long m_ref = 1;
-};
-
 // ===========================================================================
-//  预览面板（QWidget 子类，无 Q_OBJECT，不需要 moc）
+//  预览面板
 // ===========================================================================
 class MdViewPanel : public QWidget
 {
+    Q_OBJECT
 public:
     explicit MdViewPanel(QWidget* parent = nullptr)
         : QWidget(parent)
@@ -593,6 +635,9 @@ public:
     {
         if (m_poll) {
             m_poll->stop();
+        }
+        if (m_coalesce) {
+            m_coalesce->stop();
         }
         if (m_buf) {
             VirtualFree(m_buf, 0, MEM_RELEASE);
@@ -617,6 +662,9 @@ public:
         m_textFn = text;
     }
 
+    void setSettings(const MdSettings& s) { m_settings = s; }
+    MdSettings settings() const { return m_settings; }
+
     // 状态显示在停靠窗格标题上，方便一眼看出卡在哪一步
     void setStatus(const QString& s)
     {
@@ -630,6 +678,21 @@ public:
 
     // 初始化（异步创建 WebView2）。返回 false 表示立即失败。
     bool start(const QString& pluginDir);
+
+    // 立即刷新一次（菜单用）
+    void refreshNow();
+
+    // 设置变了：重新装载页面
+    void reloadPage();
+
+    // 隐藏时按设置释放 WebView2 内存
+    void releaseWebView();
+
+public slots:
+    // 编辑区内容变了（事件驱动路径）
+    void onEditorTextChanged();
+    // 标签页切换了
+    void onTabCurrentChanged(int index);
 
 protected:
     void resizeEvent(QResizeEvent* e) override
@@ -655,13 +718,13 @@ protected:
 
         if (m_poll)
             m_poll->start();
-        pollNow();
+        refreshNow();
 
         // 布局可能还没稳定，过一会儿再对一次 bounds、并补一次推送
         QTimer::singleShot(0, this, [this]() { syncBounds(); });
         QTimer::singleShot(400, this, [this]() {
             syncBounds();
-            m_lastPayload.clear();
+            m_lastText.clear();
             pushCurrentText();
         });
     }
@@ -670,7 +733,11 @@ protected:
     {
         if (m_poll)
             m_poll->stop();
+        if (m_coalesce)
+            m_coalesce->stop();
         QWidget::hideEvent(e);
+        if (m_settings.releaseOnHide)
+            releaseWebView();
     }
 
 private:
@@ -696,6 +763,8 @@ private:
     bool readCurrentText(QString& out);
     void showError(const QString& msg);
     void logChildren() const;
+    void applyRefreshMode();
+    void connectEditor(QWidget* ed);
 
     QPointer<QWidget> m_host;
     QPointer<QDockWidget> m_dock;
@@ -706,8 +775,11 @@ private:
     char* m_buf = nullptr;
     int m_bufCap = 0;
     QWidget* m_lastEditor = nullptr;
+    QWidget* m_connEditor = nullptr;
+    QWidget* m_connTab = nullptr;
     bool m_probed = false;
     bool m_warnedFallback = false;
+    MdSettings m_settings;
     HWND m_hwnd = nullptr;
     QString m_pluginDir;
     HRESULT m_coInitResult = S_OK;
@@ -717,14 +789,75 @@ private:
     ComPtr<ICoreWebView2Controller> m_ctrl;
     ComPtr<ICoreWebView2> m_view;
 
-    QTimer* m_poll = nullptr;
+    QTimer* m_poll = nullptr;       // 轮询模式下的定时器
+    QTimer* m_coalesce = nullptr;  // 事件模式下的合并定时器
     QString m_currentText;
+    QString m_lastText;
     QString m_status;
-    QByteArray m_lastPayload;
     bool m_pageReady = false;
 };
 
 // --- 面板实现 ---------------------------------------------------------------
+
+void MdViewPanel::applyRefreshMode()
+{
+    const int interval = kRefreshIntervals[m_settings.refreshMode];
+    if (!m_poll)
+        return;
+    if (interval <= 0) {
+        // 实时模式：靠 textChanged 信号，不轮询
+        m_poll->stop();
+    } else {
+        m_poll->setInterval(interval);
+        if (isVisible())
+            m_poll->start();
+    }
+}
+
+void MdViewPanel::connectEditor(QWidget* ed)
+{
+    if (m_connEditor == ed)
+        return;
+
+    if (m_connEditor)
+        m_connEditor->disconnect(this);
+    m_connEditor = ed;
+
+    if (ed) {
+        // 字符串式连接：不需要 QsciScintilla 的类定义。
+        // QsciScintilla 有 textChanged() 信号（宿主自己就用它连 Markdown 预览）。
+        QObject::connect(ed, SIGNAL(textChanged()), this, SLOT(onEditorTextChanged()));
+    }
+
+    // 标签页切换时换编辑区
+    QWidget* tab = FindTabAncestor(ed);
+    if (m_connTab != tab) {
+        if (m_connTab)
+            m_connTab->disconnect(this);
+        m_connTab = tab;
+        if (tab)
+            QObject::connect(tab, SIGNAL(currentChanged(int)), this, SLOT(onTabCurrentChanged(int)));
+    }
+}
+
+void MdViewPanel::onEditorTextChanged()
+{
+    // 合并 120ms 内的连续变化，避免打字时每个键都重渲染一次
+    if (m_coalesce)
+        m_coalesce->start(120);
+}
+
+void MdViewPanel::onTabCurrentChanged(int)
+{
+    m_lastEditor = nullptr;   // 强制重新定位编辑区
+    m_lastText.clear();
+    refreshNow();
+}
+
+void MdViewPanel::refreshNow()
+{
+    pollNow();
+}
 
 QString MdViewPanel::buildHtml(const QString& mdJs) const
 {
@@ -747,7 +880,7 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "font-family:Consolas,'Courier New',monospace;font-size:.92em;}"
         "#md pre{background:#f6f8fa;padding:14px 16px;border-radius:6px;overflow:auto;"
         "border:1px solid #e5e7eb;}"
-        "#md pre code{background:none;padding:0;font-size:.9em;line-height:1.5;}"
+        "#md pre code{background:none;padding:0;font-size:1em;line-height:1.5;}"
         "#md blockquote{margin:.8em 0;padding:.2em 1em;color:#57606a;"
         "border-left:4px solid #d0d7de;background:#f8f9fb;}"
         "#md table{border-collapse:collapse;margin:1em 0;display:block;overflow:auto;}"
@@ -756,37 +889,69 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "#md ul,#md ol{padding-left:2em;margin:.6em 0;}"
         "#md li{margin:.2em 0;}"
         "#md img{max-width:100%;}"
-        "#md hr{border:none;border-top:1px solid #d8dee4;margin:1.6em 0;}";
+        "#md hr{border:none;border-top:1px solid #d8dee4;margin:1.6em 0;}"
+        /* 公式：KaTeX 排版需要，允许横向滚动 */
+        "#md .katex-display{margin:1em 0;overflow-x:auto;overflow-y:hidden;}"
+        "#md .katex{font-size:1.05em;}"
+        /* 公式里夹中文：KaTeX 自带字体没有汉字，靠浏览器逐字回退 */
+        "#md .katex .mord.text,#md .katex .text{font-family:inherit;}";
 
-    // JS 侧：window.mdUpdate(base64) -> 解码 -> 渲染
+    // JS 侧：window.mdUpdate(text) -> 渲染
     static const char* kApi =
         "(function(){"
         "  var md = window.markdownit({html:false,linkify:true,breaks:false,"
         "typographer:false,xhtmlOut:false});"
+        "  if (window.katex && window.markdownitKatex) {"
+        "    try { md.use(window.markdownitKatex({throwOnError:false,strict:false,trust:false})); }"
+        "    catch(e) { console.log('katex plugin failed', e); }"
+        "  }"
+        "  window.mdRender = function(text){"
+        "    try{"
+        "      document.getElementById('md').innerHTML = md.render(text);"
+        "    }catch(e){"
+        "      document.getElementById('md').textContent = 'Render error: '+e;"
+        "    }"
+        "  };"
         "  window.mdUpdate = function(b64){"
         "    try{"
         "      var bin = atob(b64);"
         "      var bytes = new Uint8Array(bin.length);"
         "      for(var i=0;i<bin.length;i++){bytes[i]=bin.charCodeAt(i);}"
         "      var text = new TextDecoder('utf-8').decode(bytes);"
-        "      document.getElementById('md').innerHTML = md.render(text);"
+        "      window.mdRender(text);"
         "    }catch(e){"
         "      document.getElementById('md').textContent = 'Render error: '+e;"
         "    }"
         "  };"
         "})();";
 
+    // KaTeX 资源（从虚拟主机 https://mdview.local/ 取）
+    QString katexHead;
+    if (m_settings.katex) {
+        katexHead = QStringLiteral(
+            "<link rel=\"stylesheet\" href=\"https://mdview.local/katex.min.css\">");
+    }
+    QString katexTail;
+    if (m_settings.katex) {
+        katexTail = QStringLiteral(
+            "<script src=\"https://mdview.local/katex.min.js\"></script>"
+            "<script src=\"https://mdview.local/markdown-it-katex.js\"></script>");
+    }
+
     QString html;
     html.reserve(mdJs.size() + 8192);
     html += QStringLiteral("<!DOCTYPE html><html><head><meta charset=\"utf-8\">");
     html += QStringLiteral("<title>Markdown Preview</title>");
+    html += katexHead;
     html += QStringLiteral("<style>");
     html += QString::fromUtf8(kCss);
     html += QStringLiteral("</style></head><body>");
     html += QStringLiteral("<div id=\"md\"></div>");
     html += QStringLiteral("<script>");
     html += mdJs;
-    html += QStringLiteral("</script><script>");
+    html += QStringLiteral("</script>");
+    html += katexTail;
+    html += QStringLiteral("<script>");
     html += QString::fromUtf8(kApi);
     html += QStringLiteral("</script></body></html>");
     return html;
@@ -842,10 +1007,15 @@ bool MdViewPanel::start(const QString& pluginDir)
                << (quint32)hr;
     setStatus(QStringLiteral("env ok"));
 
-    // 轮询器：只在面板可见时跑
+    // 合并定时器：事件模式下把连续变化压成一次推送
+    m_coalesce = new QTimer(this);
+    m_coalesce->setSingleShot(true);
+    QObject::connect(m_coalesce, &QTimer::timeout, this, [this]() { pollNow(); });
+
+    // 轮询定时器：只在用户选了固定间隔时启用
     m_poll = new QTimer(this);
-    m_poll->setInterval(kPollIntervalMs);
     QObject::connect(m_poll, &QTimer::timeout, this, [this]() { pollNow(); });
+    applyRefreshMode();
 
     return true;
 }
@@ -887,6 +1057,24 @@ void MdViewPanel::navigateToApp()
     if (!m_view)
         return;
 
+    // KaTeX 资源：解包到 %TEMP%，再用虚拟主机映射暴露给网页
+    if (m_settings.katex) {
+        QString err;
+        if (!ExtractKatexAssets(&err)) {
+            qWarning() << "[ndd-mdview]" << err << "（公式渲染不可用）";
+        } else {
+            ComPtr<ICoreWebView2_3> view3;
+            if (SUCCEEDED(m_view.As(&view3)) && view3) {
+                HRESULT hr = view3->SetVirtualHostNameToFolderMapping(
+                    L"mdview.local", L"/",
+                    reinterpret_cast<LPCWSTR>(KatexAssetDir().toStdWString().c_str()),
+                    COREWEBVIEW2_VIRTUAL_HOST_RESOURCE_ALL);
+                if (FAILED(hr))
+                    qWarning() << "[ndd-mdview] 虚拟主机映射失败, hr=0x" << (quint32)hr;
+            }
+        }
+    }
+
     // markdown-it 脚本：优先用编译进 DLL 的 Qt 资源；
     // 资源缺失时回退到插件目录下的同名文件。
     QString mdJs;
@@ -923,7 +1111,7 @@ void MdViewPanel::navigateToApp()
             return;
         self->m_pageReady = true;
         self->setStatus(QStringLiteral("page ok"));
-        self->m_lastPayload.clear();
+        self->m_lastText.clear();
         self->pushCurrentText();
     });
     HRESULT hr = m_view->add_NavigationCompleted(navHandler, &token);
@@ -935,7 +1123,7 @@ void MdViewPanel::navigateToApp()
     // 乐观地先推一次；等 NavigationCompleted 再强制推一次（页面刚加载完时
     // 之前的 ExecuteScript 会丢失）
     m_pageReady = true;
-    m_lastPayload.clear();
+    m_lastText.clear();
     pushCurrentText();
 }
 
@@ -973,25 +1161,22 @@ void MdViewPanel::pushCurrentText()
     if (!m_view || !m_pageReady)
         return;
 
-    const QByteArray payload = m_currentText.toUtf8().toBase64();
-    if (payload == m_lastPayload)
+    if (m_currentText == m_lastText)
         return;
-    m_lastPayload = payload;
+    m_lastText = m_currentText;
     setStatus(QStringLiteral("实时 | %1 字符").arg(m_currentText.size()));
-    qWarning() << "[ndd-mdview] push" << payload.size() << "bytes";
 
-    const QString js = QStringLiteral("window.mdUpdate('")
-        + QString::fromLatin1(payload) + QStringLiteral("')");
-
-    // ExecuteScript 必须带完成回调（这个 SDK 版本的签名是 2 参数）
-    ExecScriptHandler* execHandler = new ExecScriptHandler(
-        [](HRESULT code, LPCWSTR) {
-            if (FAILED(code))
-                qWarning() << "[ndd-mdview] ExecuteScript failed, hr=0x"
-                           << (quint32)code;
-        });
-    m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), execHandler);
-    execHandler->Release();
+    // 直接把文本字符串推给网页：省掉 base64 编码、JS 表达式拼装与再解析
+    HRESULT hr = m_view->PostWebMessageAsString(
+        reinterpret_cast<LPCWSTR>(m_currentText.utf16()));
+    if (FAILED(hr)) {
+        qWarning() << "[ndd-mdview] PostWebMessageAsString 失败, hr=0x" << (quint32)hr;
+        // 退回老的 base64 + ExecuteScript 方式
+        const QByteArray payload = m_currentText.toUtf8().toBase64();
+        const QString js = QStringLiteral("window.mdUpdate('")
+            + QString::fromLatin1(payload) + QStringLiteral("')");
+        m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), nullptr);
+    }
 }
 
 void MdViewPanel::pollNow()
@@ -1020,7 +1205,6 @@ void MdViewPanel::pollNow()
     pushCurrentText();
 }
 
-// 取当前编辑区的全文。四条路依次尝试，成功就用哪条。
 bool MdViewPanel::readCurrentText(QString& out)
 {
     // 候选 1：宿主给的 getCurEdit 仿函数
@@ -1030,6 +1214,12 @@ bool MdViewPanel::readCurrentText(QString& out)
 
     // 候选 2：Qt 对象树里认 className == "ScintillaEditView"
     QWidget* ed = FindCurrentEditor(m_host.data());
+
+    // 事件驱动的信号要挂在「当前」编辑区上
+    if (ed != m_lastEditor) {
+        m_lastEditor = ed;
+        connectEditor(ed);
+    }
 
     if (!m_probed) {
         m_probed = true;
@@ -1045,24 +1235,6 @@ bool MdViewPanel::readCurrentText(QString& out)
                 qWarning() << "[ndd-mdview] isReadOnly(宿主指针) =" << ro;
             else
                 qWarning() << "[ndd-mdview] isReadOnly(宿主指针) -> 失败";
-        }
-        // 决定性探针：读到的是不是「活的」那个编辑器？
-        if (ed) {
-            SciBoolFn isMod = reinterpret_cast<SciBoolFn>(ResolveExport(kIsModifiedSymbol));
-            SciIntFn curLine = reinterpret_cast<SciIntFn>(ResolveExport(kCurLineSymbol));
-            bool mod = false;
-            int line = -1;
-            if (isMod && SafeSciBool(isMod, reinterpret_cast<QsciScintilla*>(ed), &mod))
-                qWarning() << "[ndd-mdview] isModified =" << mod;
-            else
-                qWarning() << "[ndd-mdview] isModified -> 失败";
-            if (curLine && SafeSciInt(curLine, reinterpret_cast<QsciScintilla*>(ed), &line))
-                qWarning() << "[ndd-mdview] getCurrentLineNumber =" << line;
-            else
-                qWarning() << "[ndd-mdview] getCurrentLineNumber -> 失败";
-            // 文件里的长度，用来和 text() 的长度对账
-            const QString path = ed->property("filePath").toString();
-            qWarning() << "[ndd-mdview] filePath =" << path;
         }
     }
 
@@ -1137,6 +1309,27 @@ bool MdViewPanel::readCurrentText(QString& out)
     return false;
 }
 
+void MdViewPanel::reloadPage()
+{
+    if (!m_view)
+        return;
+    m_pageReady = false;
+    m_lastText.clear();
+    navigateToApp();
+}
+
+void MdViewPanel::releaseWebView()
+{
+    if (!m_ctrl)
+        return;
+    qWarning() << "[ndd-mdview] 释放 WebView2 内存";
+    m_ctrl->Close();
+    m_ctrl.Reset();
+    m_view.Reset();
+    m_pageReady = false;
+    m_lastText.clear();
+}
+
 void MdViewPanel::showError(const QString& msg)
 {
     qWarning() << "[ndd-mdview]" << msg;
@@ -1167,10 +1360,11 @@ void MdViewPanel::showError(const QString& msg)
 }
 
 // ===========================================================================
-//  控制器：管停靠窗口 + 面板 + 菜单动作
+//  控制器：管停靠窗口 + 面板 + 菜单
 // ===========================================================================
 class MdController : public QObject
 {
+    Q_OBJECT
 public:
     explicit MdController(QObject* parent = nullptr) : QObject(parent) {}
 
@@ -1182,6 +1376,7 @@ public:
     SciBoolFn isROFn = nullptr;
     SciSendFn sendFn = nullptr;
     SciTextFn textFn = nullptr;
+    MdSettings settings;
 
     void ensure()
     {
@@ -1210,6 +1405,7 @@ public:
             panel->setHostWidget(host);
             panel->setDockWidget(dock);
             panel->setTextSource(getCurEdit, isROFn, sendFn, textFn);
+            panel->setSettings(settings);
             // setWidget 会把 panel 重新挂到 dock 内部容器上，
             // 必须在它之后才 winId()，否则原生窗口会被重建（WebView2 父句柄失效）。
             dock->setWidget(panel);
@@ -1224,6 +1420,7 @@ public:
             panel->resize(760, 900);
             panel->setHostWidget(host);
             panel->setTextSource(getCurEdit, isROFn, sendFn, textFn);
+            panel->setSettings(settings);
             panel->start(pluginDir);
             panel->show();
         }
@@ -1244,6 +1441,16 @@ public:
             panel->raise();
         }
     }
+
+    // 设置变了：存盘 + 让面板生效
+    void applySettings()
+    {
+        settings.save();
+        if (panel) {
+            panel->setSettings(settings);
+            panel->reloadPage();
+        }
+    }
 };
 
 // ===========================================================================
@@ -1260,10 +1467,11 @@ NDD_EXPORT bool NDD_PROC_IDENTIFY(NDD_PROC_DATA* pProcData)
 
     pProcData->m_strPlugName = QString::fromUtf8(u8"Markdown 实时预览 (WebView2)");
     pProcData->m_strComment = QString::fromUtf8(u8"在编辑区右侧实时渲染 Markdown，"
+                                                u8"支持公式（KaTeX），"
                                                 u8"基于 Microsoft Edge WebView2");
-    pProcData->m_version = QString::fromUtf8(u8"v1.0");
+    pProcData->m_version = QString::fromUtf8(u8"v1.1");
     pProcData->m_auther = QString::fromUtf8(u8"ndd-mdview");
-    pProcData->m_menuType = 0;   // 一级菜单，宿主建 QAction
+    pProcData->m_menuType = 1;   // 二级菜单，宿主把 m_rootMenu 交给我们
     return true;
 }
 
@@ -1275,12 +1483,12 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
 {
     Q_UNUSED(pluginCallBack);
     // 宿主给的 getCurEdit 仿函数保留（签名是 ABI 的一部分），
-    // 实测它返回的指针不可靠，所以只当候选之一，失败会自动换下一条路。
+    // 实测它和 Qt 对象树找到的是同一个编辑区，两个来源互相印证。
     Q_UNUSED(getCurEdit);
 
-    // m_menuType==0 的正常路径下 pProcData 有效（含 m_pAction）。
-    // 另一条路径（宿主 onPlugWork）传的是 nullptr，那种情况没法挂动作，直接退出。
-    if (pProcData == nullptr || pProcData->m_pAction == nullptr)
+    // m_menuType==1：宿主建了二级菜单，句柄在 m_rootMenu。
+    // 另一条路径（宿主 onPlugWork）传的是 nullptr，那种情况没法挂菜单，直接退出。
+    if (pProcData == nullptr || pProcData->m_rootMenu == nullptr)
         return -1;
 
     MdController* ctl = new MdController(pNotepad);
@@ -1290,10 +1498,91 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
     ctl->isROFn = reinterpret_cast<SciBoolFn>(ResolveExport(kIsReadOnlySymbol));
     ctl->sendFn = reinterpret_cast<SciSendFn>(ResolveExport(kSendScintillaSymbol));
     ctl->textFn = reinterpret_cast<SciTextFn>(ResolveExport(kTextSymbol));
+    ctl->settings = MdSettings::load();
     g_controller = ctl;
 
-    QObject::connect(pProcData->m_pAction, &QAction::triggered, ctl,
-                     [ctl]() { ctl->toggle(); }, Qt::UniqueConnection);
+    // --- 菜单 ---
+    QMenu* menu = pProcData->m_rootMenu;
+    QAction* actShow = menu->addAction(QStringLiteral("显示预览面板"));
+    actShow->setCheckable(true);
+    QObject::connect(actShow, &QAction::triggered, ctl, [ctl, actShow]() {
+        ctl->ensure();
+        if (ctl->dock) {
+            if (actShow->isChecked())
+                ctl->dock->show();
+            else
+                ctl->dock->hide();
+        } else if (ctl->panel) {
+            ctl->panel->setVisible(actShow->isChecked());
+        }
+    });
+    actShow->setChecked(true);
+
+    QAction* actRefresh = menu->addAction(QStringLiteral("立即刷新"));
+    QObject::connect(actRefresh, &QAction::triggered, ctl, [ctl]() {
+        ctl->ensure();
+        if (ctl->panel)
+            ctl->panel->refreshNow();
+    });
+
+    QMenu* menuInterval = menu->addMenu(QStringLiteral("自动更新间隔"));
+    QActionGroup* group = new QActionGroup(menuInterval);
+    for (int i = 0; i < kRefreshModeCount; ++i) {
+        QAction* a = menuInterval->addAction(QString::fromUtf8(kRefreshLabels[i]));
+        a->setCheckable(true);
+        a->setChecked(ctl->settings.refreshMode == i);
+        group->addAction(a);
+        const int mode = i;
+        QObject::connect(a, &QAction::triggered, ctl, [ctl, mode]() {
+            if (ctl->settings.refreshMode == mode)
+                return;
+            ctl->settings.refreshMode = mode;
+            ctl->applySettings();
+            if (ctl->panel) {
+                // 切换模式要重建定时器策略
+                ctl->panel->setSettings(ctl->settings);
+            }
+        });
+    }
+
+    QAction* actKatex = menu->addAction(QStringLiteral("公式渲染 (KaTeX)"));
+    actKatex->setCheckable(true);
+    actKatex->setChecked(ctl->settings.katex);
+    QObject::connect(actKatex, &QAction::triggered, ctl, [ctl, actKatex]() {
+        ctl->settings.katex = actKatex->isChecked();
+        ctl->applySettings();
+    });
+
+    QAction* actRelease = menu->addAction(QStringLiteral("隐藏面板时释放内存"));
+    actRelease->setCheckable(true);
+    actRelease->setChecked(ctl->settings.releaseOnHide);
+    QObject::connect(actRelease, &QAction::triggered, ctl, [ctl, actRelease]() {
+        ctl->settings.releaseOnHide = actRelease->isChecked();
+        ctl->applySettings();
+    });
+
+    QAction* actReload = menu->addAction(QStringLiteral("重新加载预览页"));
+    QObject::connect(actReload, &QAction::triggered, ctl, [ctl]() {
+        ctl->ensure();
+        if (ctl->panel)
+            ctl->panel->reloadPage();
+    });
+
+    QAction* actAbout = menu->addAction(QStringLiteral("关于"));
+    QObject::connect(actAbout, &QAction::triggered, ctl, [ctl]() {
+        QMessageBox::information(
+            ctl->host ? ctl->host.data() : nullptr,
+            QStringLiteral("Markdown 实时预览 (WebView2)"),
+            QStringLiteral(
+                "Notepad-- 插件 · v1.1\n\n"
+                "在编辑区右侧用 Microsoft Edge WebView2 实时渲染 Markdown。\n"
+                "支持 GFM 表格、任务列表、围栏代码块、引用，"
+                "以及 $...$ / $$...$$ 公式（KaTeX）。\n\n"
+                "更新方式：默认事件驱动（编辑区一改就更新，120ms 合并），\n"
+                "也可在「自动更新间隔」里改成固定轮询，适合超大文件。\n\n"
+                "取文依赖宿主 qscintilla 导出的 QsciScintilla::text()。\n"
+                "找不到时会退化成读磁盘文件（看不到未保存的改动）。"));
+    });
 
     return 0;
 }
@@ -1317,3 +1606,6 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD fdwReason, LPVOID lpReserved)
     }
     return TRUE;
 }
+
+// moc（MdViewPanel / MdController 用了 Q_OBJECT）
+#include "ndd-mdview.moc"
