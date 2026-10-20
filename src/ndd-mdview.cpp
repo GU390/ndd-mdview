@@ -1076,7 +1076,7 @@ void MdViewPanel::navigateToApp()
             ComPtr<ICoreWebView2_3> view3;
             if (SUCCEEDED(m_view.As(&view3)) && view3) {
                 HRESULT hr = view3->SetVirtualHostNameToFolderMapping(
-                    L"mdview.local", L"/",
+                    L"mdview.local",
                     reinterpret_cast<LPCWSTR>(KatexAssetDir().toStdWString().c_str()),
                     COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
                 if (FAILED(hr))
