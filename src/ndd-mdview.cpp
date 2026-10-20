@@ -323,6 +323,52 @@ private:
     long m_ref = 1;
 };
 
+class ExecScriptHandler final
+    : public ICoreWebView2ExecuteScriptCompletedHandler
+{
+public:
+    typedef std::function<void(HRESULT, LPCWSTR)> Fn;
+
+    explicit ExecScriptHandler(Fn fn) : m_fn(std::move(fn)) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (ppv == nullptr)
+            return E_POINTER;
+        if (riid == __uuidof(IUnknown) ||
+            riid == __uuidof(ICoreWebView2ExecuteScriptCompletedHandler)) {
+            *ppv = static_cast<ICoreWebView2ExecuteScriptCompletedHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG n = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+        if (n == 0)
+            delete this;
+        return n;
+    }
+
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT code, LPCWSTR result) override
+    {
+        m_fn(code, result);
+        return S_OK;
+    }
+
+private:
+    Fn m_fn;
+    long m_ref = 1;
+};
+
 // ===========================================================================
 //  预览面板（QWidget 子类，无 Q_OBJECT，不需要 moc）
 // ===========================================================================
@@ -641,7 +687,16 @@ void MdViewPanel::pushCurrentText()
 
     const QString js = QStringLiteral("window.mdUpdate('")
         + QString::fromLatin1(payload) + QStringLiteral("')");
-    m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()));
+
+    // ExecuteScript 必须带完成回调（这个 SDK 版本的签名是 2 参数）
+    ExecScriptHandler* execHandler = new ExecScriptHandler(
+        [](HRESULT code, LPCWSTR) {
+            if (FAILED(code))
+                qWarning() << "[ndd-mdview] ExecuteScript failed, hr=0x"
+                           << (quint32)code;
+        });
+    m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), execHandler);
+    execHandler->Release();
 }
 
 void MdViewPanel::pollNow()
