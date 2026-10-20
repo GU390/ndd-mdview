@@ -37,45 +37,82 @@
 
 ### 文本是怎么取到的
 
-宿主把 qscintilla 静态链进了 `qmyedit_qt5.dll`。两条路都走过：
+宿主把 qscintilla 静态链进了 `qmyedit_qt5.dll`。踩了三轮才对：
 
-**路线 A（已废弃）：Win32 的 SCI 消息。**
-一开始打算枚举主窗口的子孙窗口，找 Scintilla 原生窗口发 `SCI_GETTEXT`。
+**第 1 轮：Win32 的 SCI 消息 —— 不成立。**
+打算枚举主窗口的子孙窗口，找 Scintilla 原生窗口发 `SCI_GETTEXT`。
 实测枚举主窗口全部子孙，只有 `Qt5152QWindowIcon` 和 WebView2 的 `Chrome_*`，
 **根本不存在 `Scintilla` 原生窗口** —— QScintilla 的 Scintilla 那一侧是个
-QWidget（`ScintillaQt`），`SCI_*` 是走 `ScintillaBase::SendMessage` 的虚调用，
+QWidget（`ScintillaQt`），`SCI_*` 走的是 `ScintillaBase::SendMessage` 虚调用，
 不是 Win32 消息，发不出去。
 
-**路线 B（现在用的）：调宿主导出的 `QsciScintilla::text()`。**
-
-宿主插件 ABI 的 `NDD_PROC_MAIN` 第三个参数就是
-`std::function<QsciScintilla*(QWidget*)>`，用它能拿到**当前编辑区**的指针。
-而 `qmyedit_qt5.dll` 的导出表里**带着 qscintilla 的全部符号**
-（实测 2403 项），其中就有：
+**第 2 轮：调宿主导出的 `QsciScintilla::text()` —— 找到函数了，却崩了宿主。**
+`qmyedit_qt5.dll` 的导出表里带着 qscintilla 的全部符号（实测 2403 项），
+其中就有：
 
 ```
 ?text@QsciScintilla@@QEBA?AVQString@@XZ     ← QString QsciScintilla::text() const
 ```
 
 宿主自己的 Markdown 预览（`CCNotePad::slot_markdownPreview`）用的也正是
-`pEditView->text()`，所以两边渲染结果一致。
+`pEditView->text()`。所以第一版就照这个思路做：只声明一个同名同签名的最小类，
+`GetProcAddress` 拿地址后调用。
 
-于是插件里只声明一个**同名同签名的最小类**：
+结果一调用就 **0xc0000005 崩在 `qmyedit_qt5.dll` 里**：
+
+```
+错误模块名称: qmyedit_qt5.dll    异常代码: 0xc0000005    错误偏移量: 0x1c3d7d
+```
+
+把偏移映射回导出符号，落在 `QsciScintillaBase::SendScintilla` 入口 +0xd
+（第一次解引用 `this`）。再 dump 那个导出函数的机器码核对寄存器：
+
+```
+text():          mov r14, rdx   ← this = RDX      mov rbp, rcx  ← sret = RCX
+SendScintilla(): mov rcx, [rcx+30h]                ← 第一条就解引用 this
+```
+
+寄存器约定和本插件写的一致 ⇒ **不是调用约定问题，是传进去的 `this` 是垃圾**。
+而这个 `this` 来自宿主 ABI 里的 `std::function<QsciScintilla*(QWidget*)>` 仿函数
+（`getCurEdit`）。跨模块的 `std::function` 到底发生了什么不好深究，
+**不再依赖它**。
+
+**第 3 轮（现在用的）：用 Qt 自己的对象树定位编辑区。**
+
+宿主主窗口 → `findChildren<QWidget*>()` → 用 `metaObject()->className()`
+认 `"ScintillaEditView"` → 有焦点的优先，否则取可见里最大的那个。
+这条路上全是 Qt 自己的 API（`metaObject()` 是虚函数，vtable 在宿主 EXE 里，
+跨模块调用完全安全）。
+
+关键前提是继承链：
+
+```
+ScintillaEditView : QsciScintilla : QsciScintillaBase
+                  : QAbstractScrollArea : QFrame : QWidget : QObject
+```
+
+**全是单继承 ⇒ 所有基类子对象偏移都是 0 ⇒ `QWidget*` 就是 `QsciScintilla*`。**
+所以拿 QWidget* 直接当 QsciScintilla* 传给 `text()` 是对的。
+
+插件里只声明一个**同名同签名的最小类**：
 
 ```cpp
 class QsciScintilla { public: QString text() const; };
 typedef QString (*SciTextFn)(QsciScintilla* self);
 ```
 
-再用 `GetProcAddress` 拿到真实函数地址后调用。`text()` 是**非虚**成员函数，
+用 `GetProcAddress` 拿真实函数地址后调用。`text()` 是**非虚**成员函数，
 调用时编译器只把 `this` 原样传下去，不需要知道真实类的布局 ——
 所以**不需要 `qsciscintilla.h`，也不链接 qscintilla**，
 宿主升级改了 `QsciScintilla` 的成员布局也不会崩。
 
+另外在调用外面裹了一层 `__try/__except`：万一指针不对，只跳过这一轮，
+不会把宿主带崩（上一版就是崩在宿主里的）。
+
 代价是：得靠 `GetProcAddress` 认符号名，宿主哪天把 `text()` 改名就得跟着改。
 找不到符号时插件会照常加载，只是预览没有内容（停靠窗格标题会写明原因）。
 
-切换标签页后编辑区对象会换，所以每次轮询都重新调一次 `getCurEdit` 拿当前指针。
+切换标签页后编辑区对象会换，所以每次轮询都重新找一次当前编辑区。
 
 ### 文本怎么传给网页
 

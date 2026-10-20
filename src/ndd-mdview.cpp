@@ -104,14 +104,18 @@ public:
 };
 
 // MSVC x64：类类型按值返回走隐藏返回缓冲区（sret，RCX），
-// 第一个显式/隐式实参进 RDX。成员函数与同签名的自由函数寄存器布局一致，
-// 所以用自由函数指针调用是安全的。
+// 第一个显式/隐式实参进 RDX。
 //
 // 实测（dump qmyedit_qt5.dll 的机器码确认）：
 //   ?text@QsciScintilla@@QEBA?AVQString@@XZ
 //     +1a  4c 8b f2   mov r14, rdx   ← this = RDX
 //     +29  48 8b e9   mov rbp, rcx   ← sret = RCX
-typedef QString (*SciTextFn)(QsciScintilla* self);
+//
+// 所以这里声明成「自己带返回缓冲区」的形态：寄存器布局跟
+// `QString (*)(QsciScintilla*)` 完全一致（RCX=缓冲区，RDX=this），
+// 但返回缓冲区由调用方准备 —— 这样 __try 里就没有需要回卷的 C++ 对象
+// （否则 MSVC 报 C2712）。
+typedef void (*SciTextFn)(QString* ret, QsciScintilla* self);
 
 // 宿主 qscintilla 那个 DLL 里 text() 的修饰名
 static const char* kSciTextSymbol = "?text@QsciScintilla@@QEBA?AVQString@@XZ";
@@ -220,11 +224,12 @@ static QWidget* FindCurrentEditor(QWidget* host)
 }
 
 // 调 text() 时兜一层 SEH：万一指针不对，别把宿主带崩。
-// 函数里不放任何需要回卷的 C++ 对象（否则 MSVC 会报 C2712）。
+// 函数里不放任何需要回卷的 C++ 对象（否则 MSVC 会报 C2712）：
+// 返回缓冲区由调用方（pollNow）准备好，这里只传指针。
 static bool SafeSciText(SciTextFn fn, QsciScintilla* self, QString* out)
 {
     __try {
-        *out = fn(self);
+        fn(out, self);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
