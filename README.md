@@ -13,7 +13,7 @@
 - **完整 Markdown 语法**：GFM 表格、任务列表、围栏代码块、引用、链接自动识别、
   标题层级、水平线 —— 全部由 [markdown-it 14.1.0](https://github.com/markdown-it/markdown-it) 渲染。
 - **样式干净**：类 GitHub 的浅色排版，中文友好（微软雅黑）。
-- **不依赖 qscint**：取文本走 Win32 的 Scintilla 消息，规避跨模块 ABI 风险（见下）。
+- **不链接 qscint**：取文本只借宿主导出的一个符号，不引入 qscintilla 的类布局依赖（见下）。
 
 ## 安装
 
@@ -35,22 +35,47 @@
 
 ## 技术说明
 
-### 为什么不用宿主的 `getCurEdit`
+### 文本是怎么取到的
 
-宿主把 qscint 静态链进了 `qmyedit_qt5.dll`，符号不导出；而且 `QsciScintilla`
-的类布局跨版本会变，插件与主程序跨模块 `dynamic_cast` / `qobject_cast` 不可靠
-（宿主的作者在源码注释里也承认了这一点）。
+宿主把 qscintilla 静态链进了 `qmyedit_qt5.dll`。两条路都走过：
 
-本插件改为纯 Win32：枚举主窗口的子孙窗口，找类名为 `ScintillaEditView` 的
-Scintilla 原生窗口（它是 `QsciScintilla` 的子窗口），然后用
+**路线 A（已废弃）：Win32 的 SCI 消息。**
+一开始打算枚举主窗口的子孙窗口，找 Scintilla 原生窗口发 `SCI_GETTEXT`。
+实测枚举主窗口全部子孙，只有 `Qt5152QWindowIcon` 和 WebView2 的 `Chrome_*`，
+**根本不存在 `Scintilla` 原生窗口** —— QScintilla 的 Scintilla 那一侧是个
+QWidget（`ScintillaQt`），`SCI_*` 是走 `ScintillaBase::SendMessage` 的虚调用，
+不是 Win32 消息，发不出去。
 
-| 消息 | 常量 | 用途 |
-|---|---|---|
-| `SCI_GETLENGTH` | 2006 | 文档字节长度 |
-| `SCI_GETTEXT` | 2182 | 取原始字节 |
-| `SCI_GETCODEPAGE` | 2137 | 文档编码（0 / 65001 → UTF-8，1200 → UTF-16，其余走 `MultiByteToWideChar`） |
+**路线 B（现在用的）：调宿主导出的 `QsciScintilla::text()`。**
 
-取全文。**零链接依赖**，只依赖 Win32 消息，宿主升级也不容易崩。
+宿主插件 ABI 的 `NDD_PROC_MAIN` 第三个参数就是
+`std::function<QsciScintilla*(QWidget*)>`，用它能拿到**当前编辑区**的指针。
+而 `qmyedit_qt5.dll` 的导出表里**带着 qscintilla 的全部符号**
+（实测 2403 项），其中就有：
+
+```
+?text@QsciScintilla@@QEBA?AVQString@@XZ     ← QString QsciScintilla::text() const
+```
+
+宿主自己的 Markdown 预览（`CCNotePad::slot_markdownPreview`）用的也正是
+`pEditView->text()`，所以两边渲染结果一致。
+
+于是插件里只声明一个**同名同签名的最小类**：
+
+```cpp
+class QsciScintilla { public: QString text() const; };
+typedef QString (*SciTextFn)(QsciScintilla* self);
+```
+
+再用 `GetProcAddress` 拿到真实函数地址后调用。`text()` 是**非虚**成员函数，
+调用时编译器只把 `this` 原样传下去，不需要知道真实类的布局 ——
+所以**不需要 `qsciscintilla.h`，也不链接 qscintilla**，
+宿主升级改了 `QsciScintilla` 的成员布局也不会崩。
+
+代价是：得靠 `GetProcAddress` 认符号名，宿主哪天把 `text()` 改名就得跟着改。
+找不到符号时插件会照常加载，只是预览没有内容（停靠窗格标题会写明原因）。
+
+切换标签页后编辑区对象会换，所以每次轮询都重新调一次 `getCurEdit` 拿当前指针。
 
 ### 文本怎么传给网页
 
