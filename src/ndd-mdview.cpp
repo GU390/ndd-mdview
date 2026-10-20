@@ -854,17 +854,22 @@ private:
 
 void MdViewPanel::applyRefreshMode()
 {
-    const int interval = kRefreshIntervals[m_settings.refreshMode];
     if (!m_poll)
         return;
+    const int interval = kRefreshIntervals[m_settings.refreshMode];
     if (interval <= 0) {
-        // 实时模式：靠 textChanged 信号，不轮询
-        m_poll->stop();
+        // 实时模式：主要靠编辑区的 textChanged 信号（改一个字 120ms 内就推）。
+        // 但仍留一个 1 秒的看门狗：
+        //   · 编辑区可能是插件加载之后才建好的（那时还没接上信号）
+        //   · 切换标签页 / 换文件时对象会变
+        // 看门狗只做「重新定位 + 比对文本」，文本没变就不推送，
+        // 所以不会产生 markdown-it 重渲染的开销。
+        m_poll->setInterval(1000);
     } else {
         m_poll->setInterval(interval);
-        if (isVisible())
-            m_poll->start();
     }
+    if (isVisible())
+        m_poll->start();
 }
 
 void MdViewPanel::connectEditor(QWidget* ed)
