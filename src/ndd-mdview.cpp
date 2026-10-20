@@ -992,6 +992,12 @@ private:
     int m_lastSelL1 = 0;
     int m_lastSelL2 = 0;
     qint64 m_scrollSuppressUntil = 0;
+    // 滚动回声判定（要精确，见 onWebScroll）：
+    //   上次推给网页的目标行 + 推送时刻；网页滚完报回来的行跟它对得上 => 是回声。
+    int  m_pushedScrollLine = -1;
+    qint64 m_lastScrollPushAt = 0;
+    // 「选区推给网页」引起的网页滚动，不许回弹编辑区（否则选一下视口就跳）。
+    qint64 m_selScrollSuppressUntil = 0;
     // 选区同步的抑制窗口必须**独立**于滚动的那个：
     // 用户在预览里点一下/拖一下，浏览器往往同时发滚动事件（光标滚进视野），
     // 'L' 先到就把 m_scrollSuppressUntil 撑开，随后到的 'S'（选区）
@@ -1193,7 +1199,10 @@ void MdViewPanel::syncScrollFromEditor()
     m_scrollSuppressUntil = now + 250;
     qWarning() << "[ndd-mdview] 滚动同步: 编辑区首行 ->" << line << "，推给网页";
     // data-line 是 1 基，Scintilla 行号是 0 基
-    const QString js = QStringLiteral("window.mdScrollToLine(%1);").arg(line + 1);
+    const int target = line + 1;
+    m_pushedScrollLine = target;        // 记住推了哪一行，回声靠它认
+    m_lastScrollPushAt = now;
+    const QString js = QStringLiteral("window.mdScrollToLine(%1);").arg(target);
     m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), nullptr);
 }
 
@@ -1202,7 +1211,16 @@ void MdViewPanel::onWebScroll(int line)
     if (line <= 0 || !m_settings.syncScroll)
         return;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    if (now < m_scrollSuppressUntil)      // 回声，忽略
+    // ⚠️ 回声判定必须**精确**，不能用「一段时间内一律忽略」。
+    //    网页滚完会报一次当前顶行；那行跟我们刚推过去的目标一致 => 是回声，丢掉。
+    //    之前用的是「250ms 内的滚动一律忽略」—— 结果把**用户自己滚网页**也吞了，
+    //    两边的视口就此错开而且再也回不来（用户看到的「左右不同步」）。
+    if (m_pushedScrollLine > 0 && now - m_lastScrollPushAt < 2000 &&
+        line >= m_pushedScrollLine - 3 && line <= m_pushedScrollLine + 3) {
+        return;                          // 回声，忽略（保留 m_pushedScrollLine）
+    }
+    m_pushedScrollLine = -1;             // 不是回声 => 认定是用户滚的
+    if (now < m_selScrollSuppressUntil)  // 选区推送引起的滚动，不许回弹编辑区
         return;
     if (line == m_lastWebLine)
         return;
@@ -1275,8 +1293,12 @@ void MdViewPanel::syncSelectionFromEditor()
     m_lastSelL2 = l2;
     qWarning() << "[ndd-mdview] 选区同步: 编辑区选区 ->" << l1 << ".." << l2
                << (hasRange ? "（有选区）" : "（仅光标）") << "，推给网页";
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
     // 自己推过去的选区，页面会再发一个 'S' 回来 —— 这是回声，要挡掉。
-    m_selSuppressUntil = QDateTime::currentMSecsSinceEpoch() + 400;
+    m_selSuppressUntil = now + 400;
+    // 页面如果因为设了选区而滚动一下，那一下也不能回弹编辑区 ——
+    // 否则「选一下就跳几十行」（网页视口高度 ≈ 50~70 行）。
+    m_selScrollSuppressUntil = now + 400;
     const QString js = QStringLiteral("window.mdSyncSelection && window.mdSyncSelection(%1,%2,%3);")
         .arg(l1).arg(l2).arg(hasRange ? QStringLiteral("true") : QStringLiteral("false"));
     m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), nullptr);
@@ -1496,11 +1518,10 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "      var sel = window.getSelection();"
         "      sel.removeAllRanges();"
         "      sel.addRange(r);"
-        "      var rect = first.getBoundingClientRect();"
-        "      var vh = window.innerHeight || 0;"
-        "      if (rect.bottom < 0 || (vh && rect.top > vh)) {"
-        "        try { first.scrollIntoView({block:'center'}); } catch(e2){}"
-        "      }"
+        "      /* 这里**故意不 scrollIntoView**："
+        "         滚动位置由滚动同步负责保持两边对齐；"
+        "         在这里滚会把网页视口拉歪，网页再把顶行报回来，"
+        "         编辑区就被带着跳一整个视口（50~70 行）。 */"
         "      return 'ok';"
         "    } catch(e){ return 'err:' + e; }"
         "  };"
@@ -2326,7 +2347,7 @@ NDD_EXPORT bool NDD_PROC_IDENTIFY(NDD_PROC_DATA* pProcData)
     pProcData->m_strComment = QString::fromUtf8(u8"在编辑区右侧渲染 Markdown，"
                                                 u8"支持公式（KaTeX），"
                                                 u8"基于 Microsoft Edge WebView2");
-    pProcData->m_version = QString::fromUtf8(u8"v1.5");
+    pProcData->m_version = QString::fromUtf8(u8"v1.6");
     pProcData->m_auther = QString::fromUtf8(u8"ndd-mdview");
     pProcData->m_menuType = 1;   // 二级菜单，宿主把 m_rootMenu 交给我们
     return true;
@@ -2443,7 +2464,7 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
             ctl->host ? ctl->host.data() : nullptr,
             QStringLiteral("Markdown 预览 (WebView2)"),
             QStringLiteral(
-                "Notepad-- 插件 · v1.5\n\n"
+                "Notepad-- 插件 · v1.6\n\n"
                 "在编辑区右侧用 Microsoft Edge WebView2 渲染 Markdown。\n"
                 "支持 GFM 表格、任务列表、围栏代码块、引用，"
                 "以及 $...$ / $$...$$ 公式（KaTeX）。\n\n"
