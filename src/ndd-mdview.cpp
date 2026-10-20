@@ -857,6 +857,9 @@ public:
     // 自测：在网页里滚到第 line 行（模拟「用户自己滚网页」），宿主应把编辑区也滚过去
     void testWebScroll(int line);
 
+    // 页面是否就绪（自测钩子要等它，否则推送根本发不出去）
+    bool isPageReady() const { return m_pageReady; }
+
     // 把渲染结果统计回读到日志（无头验证用：katex 元素数、公式出错数、正文长度）
     void logRenderStats();
 
@@ -971,7 +974,6 @@ private:
     // 只做**最小滚动**：保证选区可见，但不把编辑区拽到区间第一行。
     // （预览回传的是「整块」的行号范围，滚到区间头就是用户说的「跳 50~70 行」）
     void ensureEditorSelectionVisible();
-    bool isPageReady() const { return m_pageReady; }
     void syncScrollFromEditor();
 
     QPointer<QWidget> m_host;
