@@ -771,6 +771,8 @@ private:
 // ===========================================================================
 //  预览面板
 // ===========================================================================
+class MdController;   // 前向声明：面板要反向指回控制器
+
 class MdViewPanel : public QWidget
 {
     Q_OBJECT
@@ -859,6 +861,9 @@ public:
 
     // 页面是否就绪（自测钩子要等它，否则推送根本发不出去）
     bool isPageReady() const { return m_pageReady; }
+
+    // 反向指回控制器（页面报 'R' 内容就绪时，要转给控制器触发待跑的自测）
+    void setController(MdController* c) { m_controller = c; }
 
     // 把渲染结果统计回读到日志（无头验证用：katex 元素数、公式出错数、正文长度）
     void logRenderStats();
@@ -978,6 +983,7 @@ private:
 
     QPointer<QWidget> m_host;
     QPointer<QDockWidget> m_dock;
+    MdController* m_controller = nullptr;   // 反向指回控制器（页面报 'R' 时转发）
     std::function<QsciScintilla*(QWidget*)> m_getCurEdit;
     SciBoolFn m_isROFn = nullptr;
     SciSendFn m_sendFn = nullptr;
@@ -1837,8 +1843,9 @@ void MdViewPanel::navigateToApp()
         if (s.startsWith(QLatin1Char('L'))) {
             self->onWebScroll(s.mid(1).toInt());
         } else if (s.startsWith(QLatin1Char('R'))) {
-            // 页面内容渲染完了 -> 跑待办的自测
-            self->onContentReady();
+            // 页面内容渲染完了 -> 跑待办的自测（控制器那边管）
+            if (self->m_controller)
+                self->m_controller->onContentReady();
         } else if (s.startsWith(QLatin1Char('S'))) {
             const QStringList p = s.mid(1).split(QLatin1Char(','));
             if (p.size() == 2)
@@ -2344,6 +2351,7 @@ public:
             dock = new QDockWidget(QStringLiteral("Markdown 预览"), mw);
             dock->setObjectName(QStringLiteral("ndd_mdview_dock"));
             panel = new MdViewPanel(dock);
+            panel->setController(this);
             panel->setHostWidget(host);
             panel->setDockWidget(dock);
             panel->setTextSource(getCurEdit, isROFn, sendFn, textFn);
@@ -2362,6 +2370,7 @@ public:
         } else {
             // 退化：不是 QMainWindow 就开独立顶层窗口
             panel = new MdViewPanel(nullptr);
+            panel->setController(this);
             panel->setWindowFlags(Qt::Window);
             panel->setWindowTitle(QStringLiteral("Markdown 预览"));
             panel->resize(760, 900);
