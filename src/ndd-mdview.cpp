@@ -1702,20 +1702,6 @@ bool MdViewPanel::readCurrentText(QString& out)
     return false;
 }
 
-int MdViewPanel::editorLineCount()
-{
-    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
-        return -1;
-    int n = -1;
-    __try {
-        n = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
-                          SCI_GETLINECOUNT, 0, 0);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return -1;
-    }
-    return n;
-}
-
 void MdViewPanel::testScrollSync(int line)
 {
     qWarning() << "[ndd-mdview] 同步测试: 初始 firstLine=" << editorFirstVisibleLine()
