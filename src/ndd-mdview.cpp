@@ -56,6 +56,7 @@
 #include <QDockWidget>
 #include <QMessageBox>
 #include <QPointer>
+#include <QScrollBar>
 #include <QSettings>
 #include <QShowEvent>
 #include <QHideEvent>
@@ -291,6 +292,8 @@ static QWidget* FindCurrentEditor(QWidget* host)
 #define SCI_GETLENGTH      2006
 #define SCI_GETTEXT        2182
 #define SCI_GETCODEPAGE    2137
+#define SCI_GETFIRSTVISIBLELINE 2153
+#define SCI_LINESCROLLTO   2160
 
 // 在 4GB 以下申请一块缓冲区。
 // SendScintilla 的 lParam 修饰名里是 32 位（J/K），指针有可能被截断，
@@ -668,6 +671,58 @@ private:
     long m_ref = 1;
 };
 
+class WebMessageHandler final
+    : public ICoreWebView2WebMessageReceivedEventHandler
+{
+public:
+    typedef std::function<void(const QString&)> Fn;
+
+    explicit WebMessageHandler(Fn fn) : m_fn(std::move(fn)) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (ppv == nullptr)
+            return E_POINTER;
+        if (riid == __uuidof(IUnknown) ||
+            riid == __uuidof(ICoreWebView2WebMessageReceivedEventHandler)) {
+            *ppv = static_cast<ICoreWebView2WebMessageReceivedEventHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG n = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+        if (n == 0)
+            delete this;
+        return n;
+    }
+
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2*,
+                                     ICoreWebView2WebMessageReceivedEventArgs* args) override
+    {
+        LPWSTR msg = nullptr;
+        if (args != nullptr && SUCCEEDED(args->get_WebMessageAsString(&msg)) && msg != nullptr) {
+            const QString s = QString::fromWCharArray(msg);
+            CoTaskMemFree(msg);
+            m_fn(s);
+        }
+        return S_OK;
+    }
+
+private:
+    Fn m_fn;
+    long m_ref = 1;
+};
+
 // ===========================================================================
 //  预览面板
 // ===========================================================================
@@ -731,6 +786,9 @@ public:
     // 立即刷新一次（菜单用）
     void refreshNow();
 
+    // 自测：把编辑区滚到某行，再读回网页当前的行号（验证滚动同步）
+    void testScrollSync(int line);
+
     // 把渲染结果统计回读到日志（无头验证用：katex 元素数、公式出错数、正文长度）
     void logRenderStats();
 
@@ -745,6 +803,8 @@ public slots:
     void onEditorTextChanged();
     // 标签页切换了
     void onTabCurrentChanged(int index);
+    // 网页滚动了（预览 -> 编辑区）
+    void onWebScroll(int line);
 
 protected:
     void resizeEvent(QResizeEvent* e) override
@@ -775,6 +835,8 @@ protected:
 
         if (m_poll)
             m_poll->start();
+        if (m_scrollPoll)
+            m_scrollPoll->start();
         refreshNow();
 
         // 布局可能还没稳定，过一会儿再对一次 bounds、并补一次推送
@@ -792,6 +854,8 @@ protected:
             m_poll->stop();
         if (m_coalesce)
             m_coalesce->stop();
+        if (m_scrollPoll)
+            m_scrollPoll->stop();
         QWidget::hideEvent(e);
         if (m_settings.releaseOnHide)
             releaseWebView();
@@ -823,6 +887,12 @@ private:
     void applyRefreshMode();
     void connectEditor(QWidget* ed);
 
+    // --- 滚动同步 ---
+    void setupScrollSync(QWidget* editor);
+    int  editorFirstVisibleLine();
+    void scrollEditorToLine(int line);
+    void syncScrollFromEditor();
+
     QPointer<QWidget> m_host;
     QPointer<QDockWidget> m_dock;
     std::function<QsciScintilla*(QWidget*)> m_getCurEdit;
@@ -834,6 +904,14 @@ private:
     QWidget* m_lastEditor = nullptr;
     QWidget* m_connEditor = nullptr;
     QWidget* m_connTab = nullptr;
+    // 滚动同步
+    QWidget* m_scrollEditor = nullptr;
+    QScrollBar* m_scrollBar = nullptr;
+    QMetaObject::Connection m_scrollConn;
+    QTimer* m_scrollPoll = nullptr;
+    int m_lastEditorLine = -1;
+    int m_lastWebLine = -1;
+    qint64 m_scrollSuppressUntil = 0;
     bool m_probed = false;
     bool m_warnedFallback = false;
     MdSettings m_settings;
@@ -853,6 +931,7 @@ private:
     QString m_status;
     bool m_pageReady = false;
     bool m_usePostMessage = false;   // 页面是否支持原生消息通道
+    bool m_symbolsResolved = false;  // 导出符号是否已解析过
     qint64 m_lastStatsMs = 0;        // 渲染统计的节流时间戳
 };
 
@@ -902,6 +981,103 @@ void MdViewPanel::connectEditor(QWidget* ed)
         if (tab)
             QObject::connect(tab, SIGNAL(currentChanged(int)), this, SLOT(onTabCurrentChanged(int)));
     }
+}
+
+void MdViewPanel::setupScrollSync(QWidget* editor)
+{
+    if (m_scrollEditor == editor)
+        return;
+
+    // 断掉旧的
+    if (m_scrollConn) {
+        QObject::disconnect(m_scrollConn);
+        m_scrollConn = QMetaObject::Connection();
+    }
+    m_scrollBar = nullptr;
+    m_scrollEditor = editor;
+    m_lastEditorLine = -1;
+    m_lastWebLine = -1;
+
+    if (editor == nullptr)
+        return;
+
+    // 优先用编辑区自己的滚动条信号（事件驱动，零 CPU）
+    m_scrollBar = editor->findChild<QScrollBar*>(QString(), Qt::Vertical);
+    if (m_scrollBar) {
+        m_scrollConn = QObject::connect(m_scrollBar, &QScrollBar::valueChanged,
+                                       this, [this](int) { syncScrollFromEditor(); });
+        qWarning() << "[ndd-mdview] 滚动同步: 用编辑区滚动条信号";
+    } else {
+        // 退路：定时轮询首行（只在面板可见时跑）
+        if (!m_scrollPoll) {
+            m_scrollPoll = new QTimer(this);
+            m_scrollPoll->setInterval(100);
+            QObject::connect(m_scrollPoll, &QTimer::timeout,
+                             this, [this]() { syncScrollFromEditor(); });
+        }
+        m_scrollPoll->start();
+        qWarning() << "[ndd-mdview] 滚动同步: 退回 100ms 轮询";
+    }
+
+    // 顺带验一下 SendScintilla 能不能用（读编辑区首行）
+    qWarning() << "[ndd-mdview] 滚动同步: 编辑区首行 ="
+               << editorFirstVisibleLine();
+}
+
+int MdViewPanel::editorFirstVisibleLine()
+{
+    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
+        return -1;
+    int line = -1;
+    __try {
+        line = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                             SCI_GETFIRSTVISIBLELINE, 0, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+    return line;
+}
+
+void MdViewPanel::scrollEditorToLine(int line)
+{
+    if (m_sendFn == nullptr || m_scrollEditor == nullptr || line < 0)
+        return;
+    __try {
+        m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                 SCI_LINESCROLLTO, (unsigned long)line, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+void MdViewPanel::syncScrollFromEditor()
+{
+    if (!m_view || !m_pageReady)
+        return;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now < m_scrollSuppressUntil)     // 正在做同步，忽略回声
+        return;
+    const int line = editorFirstVisibleLine();
+    if (line < 0 || line == m_lastEditorLine)
+        return;
+    m_lastEditorLine = line;
+    m_scrollSuppressUntil = now + 250;
+    // data-line 是 1 基，Scintilla 行号是 0 基
+    const QString js = QStringLiteral("window.mdScrollToLine(%1);").arg(line + 1);
+    m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), nullptr);
+}
+
+void MdViewPanel::onWebScroll(int line)
+{
+    if (line <= 0)
+        return;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now < m_scrollSuppressUntil)      // 回声，忽略
+        return;
+    if (line == m_lastWebLine)
+        return;
+    m_lastWebLine = line;
+    m_scrollSuppressUntil = now + 250;
+    scrollEditorToLine(line - 1);
 }
 
 void MdViewPanel::onEditorTextChanged()
@@ -972,6 +1148,30 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "    try { md.use(window.mdviewMath, {throwOnError:false,strict:false,trust:false}); }"
         "    catch(e) { console.log('math plugin failed', e); }"
         "  }"
+        /* 给块级元素加 data-line：markdown-it 的 block token 带 token.map（0 基行号），
+           有了它就能做「编辑区行号 <-> 预览位置」的精确滚动同步。 */
+        "  (function(){"
+        "    var names = ['paragraph_open','heading_open','blockquote_open',"
+        "'list_item_open','table_open','tr_open','fence','code_block','hr',"
+        "'html_block','math_block'];"
+        "    var rules = md.renderer.rules;"
+        "    for (var i = 0; i < names.length; i++) {"
+        "      (function(n){"
+        "        var orig = rules[n];"
+        "        rules[n] = function(tokens, idx, opts, env, self){"
+        "          var token = tokens[idx];"
+        "          var html = orig ? orig(tokens, idx, opts, env, self)"
+        "                           : self.renderToken(tokens, idx, opts);"
+        "          if (token && token.map) {"
+        "            var line = token.map[0] + 1;"
+        "            html = html.replace(/^<([a-zA-Z][a-zA-Z0-9]*)/,"
+        "                             '<$1 data-line=\"' + line + '\"');"
+        "          }"
+        "          return html;"
+        "        };"
+        "      })(names[i]);"
+        "    }"
+        "  })();"
         "  window.mdRender = function(text){"
         "    try{"
         "      document.getElementById('md').innerHTML = md.render(text);"
@@ -990,6 +1190,31 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "      document.getElementById('md').textContent = 'Render error: '+e;"
         "    }"
         "  };"
+        /* --- 滚动同步 --- */
+        "  function lineEls(){ return document.querySelectorAll('#md [data-line]'); }"
+        /* 行号 -> 滚动到对应块 */
+        "  window.mdScrollToLine = function(line){"
+        "    var els = lineEls(), best = null, bestLine = -1, i, l;"
+        "    for (i = 0; i < els.length; i++){"
+        "      l = parseInt(els[i].getAttribute('data-line'), 10);"
+        "      if (!isNaN(l) && l <= line && l > bestLine){ bestLine = l; best = els[i]; }"
+        "    }"
+        "    var top = (window.pageYOffset || document.documentElement.scrollTop || 0);"
+        "    var y = best ? (best.getBoundingClientRect().top + top - 6) : 0;"
+        "    window.scrollTo(0, Math.max(0, y));"
+        "  };"
+        /* 当前视口顶部的行号（预览 -> 编辑区） */
+        "  window.mdCurrentLine = function(){"
+        "    var els = lineEls(), line = 1, i, r, l;"
+        "    for (i = 0; i < els.length; i++){"
+        "      r = els[i].getBoundingClientRect();"
+        "      if (r.bottom < 4){"
+        "        l = parseInt(els[i].getAttribute('data-line'), 10);"
+        "        if (!isNaN(l)) line = l;"
+        "      } else break;"
+        "    }"
+        "    return line;"
+        "  };"
         /* 能不能用原生消息通道（宿主 PostWebMessageAsString）？
            页面加载完宿主会问一句 window.mdvSupportsPost，
            答 1 就走原生通道（省掉 base64 编码和三次拷贝），
@@ -1002,6 +1227,15 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "        window.mdRender(e.data);"
         "      });"
         "      window.mdvSupportsPost = true;"
+        /* 预览滚动 -> 通知宿主（80ms 节流） */
+        "      var last = 0;"
+        "      window.addEventListener('scroll', function(){"
+        "        var now = Date.now();"
+        "        if (now - last < 80) { return; }"
+        "        last = now;"
+        "        try { window.chrome.webview.postMessage('L' + window.mdCurrentLine()); }"
+        "        catch(e){}"
+        "      }, {passive:true});"
         "    }"
         "  }catch(e){ window.mdvSupportsPost = false; }"
         "})();";
@@ -1222,6 +1456,17 @@ void MdViewPanel::navigateToApp()
     navHandler->Release();
     (void)hr;
 
+    // 网页 -> 宿主的滚动通知（预览滚动时告诉宿主当前行号）
+    EventRegistrationToken msgToken;
+    WebMessageHandler* msgHandler = new WebMessageHandler([self](const QString& s) {
+        if (!self)
+            return;
+        if (s.startsWith(QLatin1Char('L')))
+            self->onWebScroll(s.mid(1).toInt());
+    });
+    m_view->add_WebMessageReceived(msgHandler, &msgToken);
+    msgHandler->Release();
+
     m_view->NavigateToString(reinterpret_cast<LPCWSTR>(html.utf16()));
 
     // 乐观地先推一次；等 NavigationCompleted 再强制推一次（页面刚加载完时
@@ -1312,7 +1557,8 @@ void MdViewPanel::pollNow()
         syncBounds();
 
     // 宿主的 qscintilla 模块可能比插件晚加载，这里兜底重试
-    if (!m_textFn && !m_sendFn) {
+    if (!m_symbolsResolved) {
+        m_symbolsResolved = true;
         m_textFn = reinterpret_cast<SciTextFn>(ResolveExport(kTextSymbol));
         m_isROFn = reinterpret_cast<SciBoolFn>(ResolveExport(kIsReadOnlySymbol));
         m_sendFn = reinterpret_cast<SciSendFn>(ResolveExport(kSendScintillaSymbol));
@@ -1342,6 +1588,7 @@ bool MdViewPanel::readCurrentText(QString& out)
     if (ed != m_lastEditor) {
         m_lastEditor = ed;
         connectEditor(ed);
+        setupScrollSync(ed);
     }
 
     if (!m_probed) {
@@ -1441,6 +1688,29 @@ bool MdViewPanel::readCurrentText(QString& out)
     }
 
     return false;
+}
+
+void MdViewPanel::testScrollSync(int line)
+{
+    qWarning() << "[ndd-mdview] 同步测试: 把编辑区滚到第" << line << "行";
+    scrollEditorToLine(line);
+    QTimer::singleShot(1500, this, [this, line]() {
+        if (!m_view)
+            return;
+        ExecScriptHandler* h = new ExecScriptHandler(
+            [line](HRESULT code, LPCWSTR result) {
+                if (FAILED(code) || result == nullptr) {
+                    qWarning() << "[ndd-mdview] 同步测试: 问不到网页";
+                    return;
+                }
+                const QString s = QString::fromWCharArray(result);
+                qWarning() << "[ndd-mdview] 同步测试: 目标行 =" << line
+                           << " 网页当前行 =" << s
+                           << (s.toInt() == line ? "  ✔ 同步成功" : "  ✘ 不同步");
+            });
+        m_view->ExecuteScript(L"String(window.mdCurrentLine ? window.mdCurrentLine() : 'no-fn')", h);
+        h->Release();
+    });
 }
 
 void MdViewPanel::logRenderStats()
@@ -1784,6 +2054,14 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
             QApplication::sendEvent(ed, &press);
             QKeyEvent release(QEvent::KeyRelease, Qt::Key_Z, Qt::NoModifier, QStringLiteral("Z"));
             QApplication::sendEvent(ed, &release);
+        });
+    }
+
+    // 环境变量自测滚动同步：NDD_MDVIEW_TESTSYNC=1
+    if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTSYNC")) {
+        QTimer::singleShot(8000, ctl, [ctl]() {
+            if (ctl->panel)
+                ctl->panel->testScrollSync(40);
         });
     }
 
