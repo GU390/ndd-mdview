@@ -19,8 +19,9 @@
   [KaTeX 0.16.11](https://katex.org) 排版；公式里夹中文也能正常显示。
 - **滚动同步**：拖动编辑区的滚动条，右侧预览跟着滚到同一段内容；
   反过来滚预览，编辑区也会跟着走。**可开关**。
-- **选区同步**：在编辑区选中一段文字（比如一个公式），右侧预览里对应的块会高亮；
-  反过来在预览里选中内容，编辑区也会选中对应的行。**可开关**。
+- **选区同步**：在编辑区选中一段文字（比如一个公式），右侧预览里对应的块会高亮，
+  **而且预览里也会做出真正对应的选区**（左右选中的文字是真的同一段）；
+  反过来在预览里选中内容，编辑区也会选中对应的行并滚过去。**可开关**。
 - **省内存**：隐藏面板时可释放 WebView2（省约 120 MB），再次打开自动重建。
 - **样式干净**：类 GitHub 的浅色排版，中文友好（微软雅黑）。
 - **不链接 qscint**：取文本只借宿主导出的一个符号，不引入 qscintilla 的类布局依赖（见下）。
@@ -345,6 +346,53 @@ cmake --build build --config Release
   停靠窗格标题会提示。日志里会明确写出走了哪条路。
 - 公式排版用 KaTeX，只支持 TeX 常见语法；需要 Mermaid 流程图 / 折叠区块之类
   得再接对应的前端库。
+
+## 崩溃诊断（v1.5）
+
+宿主崩过一次（`Qt5Core.dll` / `0xC0000005` / 偏移 `0x1f6af3`）。
+把这条指令反汇编出来是：
+
+```asm
+mov      rax, qword ptr [r13 + 8]
+mov      rsi, qword ptr [rax + 0x40]
+test     rsi, rsi
+je       ...
+lock inc dword ptr [rsi + 4]     ; 崩在这
+```
+
+`lock inc` 是**原子引用计数 +1**；而 `rsi` 是从一个（已失效的）对象里取出来的指针。
+再看这个函数所在的地址区间，落在 Qt5Core 的
+`QObject::destroyed` / `QMetaObject::disconnect` / `QObjectPrivate::disconnectOne`
+之间，函数内部调的是 `QBasicMutex::lockInternal` + `QMetaObjectPrivate::signal` ——
+**这就是「断开信号槽连接时遍历连接表」的代码**。
+
+结论：**对已经销毁的 QObject 调 `disconnect()`，在已释放的内存上走连接表 → use-after-free。**
+
+插件里正好有这么两处（宿主源码 `ccnotepad.cpp` 确认了关标签页会
+`ui.editTabWidget->removeTab(index); pw->deleteLater();`，编辑控件是真的会被销毁的）：
+
+```cpp
+if (m_connEditor) m_connEditor->disconnect(this);   // 编辑区可能已被销毁
+if (m_connTab)    m_connTab->disconnect(this);
+```
+
+v1.5 的修法：**这些指针全部改成 `QPointer<QWidget>`**。
+`QPointer` 在 QObject 被销毁时自动置空，于是「对已销毁对象 disconnect」这条路直接消失；
+同时也挡住了 100ms 轮询里 `SendScintilla` / `firstVisibleLine()` 打到野指针上。
+
+> use-after-free 的崩溃是**不确定的**：刚释放、还没被复用的内存通常还是「看起来正常」的，
+> 所以本地压力测试不一定能复现（本机 v1.4 跑 6 轮开关标签页也没崩）。
+> 真正的暴露窗口是「长时间开着 + 内存被反复分配」的长会话 —— 和用户遇到的情况吻合。
+>
+> 想拿到确凿的栈，可以让 Windows 崩溃时自动转储（**需要管理员权限**，请自己执行）：
+>
+> ```powershell
+> New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Notepad--.exe' -Force | Out-Null
+> Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Notepad--.exe' -Name DumpType -Value 2
+> Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Notepad--.exe' -Name DumpFolder -Value 'C:\Dumps'
+> ```
+>
+> 下次崩了会在 `C:\Dumps` 留下 `.dmp`，用 WinDbg / Visual Studio 打开就能看到真正的崩溃栈。
 - 超大文件每次更新都要整篇取一遍、并让 markdown-it 整篇重排，会有可感知开销；
   这时把「自动更新间隔」调慢一些。
 - 打开面板会拉起 WebView2（6 个进程，120~340 MB）。介意的话打开
