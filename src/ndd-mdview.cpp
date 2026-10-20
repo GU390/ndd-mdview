@@ -756,10 +756,15 @@ protected:
     {
         QWidget::showEvent(e);
 
-        // 停靠位置变化 / 浮动 / 还原 时，Qt 可能重建原生窗口，
-        // 那样 WebView2 的父句柄就失效了 —— 检测到变化就重建控制器。
         HWND cur = reinterpret_cast<HWND>(winId());
-        if (m_view && cur != m_hwnd) {
+        if (!m_view && m_env) {
+            // 上次隐藏时按设置释放了 WebView2（省内存），这里重新建一个
+            m_hwnd = cur;
+            m_pageReady = false;
+            createController();
+        } else if (m_view && cur != m_hwnd) {
+            // 停靠位置变化 / 浮动 / 还原 时，Qt 可能重建原生窗口，
+            // 那样 WebView2 的父句柄就失效了 —— 检测到变化就重建控制器。
             m_hwnd = cur;
             m_ctrl.Reset();
             m_view.Reset();
@@ -1751,6 +1756,15 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
             } else if (ctl->panel) {
                 ctl->panel->show();
             }
+        });
+    }
+
+    // 环境变量自动隐藏面板：NDD_MDVIEW_AUTOHIDE=1（10 秒后），
+    // 用来验证「隐藏时释放 WebView2 内存」这条路径
+    if (qEnvironmentVariableIsSet("NDD_MDVIEW_AUTOHIDE")) {
+        QTimer::singleShot(10000, ctl, [ctl]() {
+            if (ctl->dock)
+                ctl->dock->hide();
         });
     }
 
