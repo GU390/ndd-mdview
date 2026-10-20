@@ -1228,6 +1228,23 @@ void MdViewPanel::syncSelectionFromEditor()
     m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), nullptr);
 }
 
+// 在编辑区里选中 l1..l2 行（1 基）。
+// 单独拆出来：带 __try 的函数里不能有需要回卷的 C++ 对象（MSVC 报 C2712），
+// 所以这个函数里只准出现指针和 int。
+static bool SciSelectLines(SciSendFn send, QsciScintilla* ed, int l1, int l2)
+{
+    __try {
+        int start = (int)send(ed, SCI_POSITIONFROMLINE, (unsigned long)(l1 - 1), 0);
+        int end = (int)send(ed, SCI_POSITIONFROMLINE, (unsigned long)l2, 0) - 1;
+        if (end < start)
+            end = start;
+        send(ed, SCI_SETSEL, (unsigned long)start, (long)end);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // 预览里选了内容 -> 编辑区选中对应的行
 void MdViewPanel::onWebSelection(int l1, int l2)
 {
@@ -1238,18 +1255,8 @@ void MdViewPanel::onWebSelection(int l1, int l2)
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (now < m_scrollSuppressUntil)
         return;
-    int start = 0, end = 0;
-    __try {
-        start = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
-                              SCI_POSITIONFROMLINE, (unsigned long)(l1 - 1), 0);
-        end = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
-                            SCI_POSITIONFROMLINE, (unsigned long)l2, 0) - 1;
-        if (end < start) end = start;
-        m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
-                 SCI_SETSEL, (unsigned long)start, (long)end);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    if (!SciSelectLines(m_sendFn, reinterpret_cast<QsciScintilla*>(m_scrollEditor), l1, l2))
         return;
-    }
     m_scrollSuppressUntil = now + 250;
     qWarning() << "[ndd-mdview] 选区同步: 网页行 " << l1 << ".." << l2 << " -> 编辑区选中";
 }
