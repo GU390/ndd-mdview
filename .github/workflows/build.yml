@@ -1,0 +1,73 @@
+name: build-plugin
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ndd-mdview (x64)
+    runs-on: windows-2022
+    env:
+      WV2_VER: 1.0.2903.40
+      QT_VER: 5.15.2
+      QT_ARCH: win64_msvc2019_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch WebView2 SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path '3rdparty' | Out-Null
+          $nupkg = Join-Path (Get-Location) '3rdparty\webview2.zip'
+          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/$env:WV2_VER" -OutFile $nupkg
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $dest = Join-Path (Get-Location) '3rdparty\webview2'
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($nupkg, $dest)
+          Write-Host "--- extracted ---"
+          Get-ChildItem -Path $dest -Recurse -Filter 'WebView2*' | Select-Object -ExpandProperty FullName
+
+      - name: Install Qt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --upgrade pip
+          python -m pip install aqtinstall
+          python -m aqt install-qt windows desktop $env:QT_VER $env:QT_ARCH -m qtbase --outputdir "${{ github.workspace }}\Qt"
+          Write-Host "--- qt root ---"
+          Get-ChildItem "${{ github.workspace }}\Qt\$env:QT_VER" | Select-Object -ExpandProperty Name
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            "-DCMAKE_PREFIX_PATH=${{ github.workspace }}\Qt\$env:QT_VER\$env:QT_ARCH"
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --build build --config Release --parallel
+          Get-ChildItem -Path build -Recurse -Filter 'ndd-mdview.dll' |
+            Select-Object FullName, Length
+
+      - name: Collect artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path 'dist' | Out-Null
+          Copy-Item 'build\bin\Release\ndd-mdview.dll' 'dist\'
+          Get-ChildItem 'dist' | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ndd-mdview-x64
+          path: dist/
