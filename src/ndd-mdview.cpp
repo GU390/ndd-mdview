@@ -119,8 +119,21 @@ typedef int (*SciIntFn)(QsciScintilla* self);
 // this=RCX，参数 EDX/R8D/R9D，返回 long（EAX）
 typedef long (*SciSendFn)(QsciScintilla* self, unsigned int msg,
                           unsigned long wParam, long lParam);
-// sret 槽在 RCX，this 在 RDX（已用机器码核对过 text() 的真实约定）
-typedef void (*SciTextFn)(void* retSlot, void* self);
+// sret 槽在 RDX，this 在 RCX。
+//
+// ⚠️ 这是**成员函数**的规则，不是自由函数的！MSVC x64 里：
+//   自由函数返回类类型 → RCX=隐藏返回缓冲区，RDX=第一个实参
+//   成员函数返回类类型 → RCX=this，RDX=隐藏返回缓冲区
+// 用 capstone dump qmyedit_qt5.dll 的 text() 机器码核对过：
+//   mov r14, rdx        ; 取回入口 RDX（返回槽）
+//   mov rbp, rcx        ; 存入口 RCX（this）
+//   call SendScintilla  ; RCX 未改 —— SendScintilla 内部 mov rcx,[rcx+30]，
+//                        ; 所以 RCX 必须是 this
+//   ...
+//   mov rax, r14        ; 返回槽地址放 RAX
+// 一开始按自由函数的规则写（RCX=槽、RDX=this）→ 被调方把返回槽当 this
+// 解引用 [rcx+0x30] → 越界访问违例 → 被 SEH 吞掉 → 静默走了读文件的兜底。
+typedef void (*SciTextFn)(void* self, void* retSlot);
 
 // 宿主 qscintilla 那个 DLL 里的修饰名
 static const char* kIsReadOnlySymbol = "?isReadOnly@QsciScintilla@@QEBA_NXZ";
@@ -341,7 +354,8 @@ static bool SafeSciInt(SciIntFn fn, QsciScintilla* ed, int* out)
 
 // 调 QsciScintilla::text() 取全文。
 //
-// sret 的返回槽用**裸缓冲**而不是 QString 局部变量：
+// 约定：RCX = this，RDX = 隐藏返回缓冲区（见 SciTextFn 的注释）。
+// 返回缓冲区用**裸缓冲**而不是 QString 局部变量：
 // 万一调用过程中崩了，槽里可能是个半构造的 QString，
 // 交给 Qt 的析构函数去释放就会踩坏堆（实测会变成 BEX64 栈/缓冲区溢出）。
 // 用裸缓冲就没有这个风险 —— 崩了直接丢弃这块内存。
@@ -351,7 +365,7 @@ static bool SafeSciInt(SciIntFn fn, QsciScintilla* ed, int* out)
 static bool CallTextRaw(SciTextFn fn, void* self, void* slot)
 {
     __try {
-        fn(slot, self);
+        fn(self, slot);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -693,6 +707,7 @@ private:
     int m_bufCap = 0;
     QWidget* m_lastEditor = nullptr;
     bool m_probed = false;
+    bool m_warnedFallback = false;
     HWND m_hwnd = nullptr;
     QString m_pluginDir;
     HRESULT m_coInitResult = S_OK;
@@ -1053,7 +1068,9 @@ bool MdViewPanel::readCurrentText(QString& out)
 
     // 路 1 / 路 2：调 QsciScintilla::text()
     if (m_textFn) {
-        alignas(8) unsigned char slot[32];
+        // 64 字节：QString 本体 8 字节，留足余量，
+        // 万一约定再出岔子也不会读到缓冲外面去
+        alignas(8) unsigned char slot[64];
         if (fromHost) {
             memset(slot, 0, sizeof(slot));
             if (CallTextRaw(m_textFn, fromHost, slot)) {
@@ -1106,6 +1123,11 @@ bool MdViewPanel::readCurrentText(QString& out)
         if (!path.isEmpty()) {
             QFile f(path);
             if (f.open(QIODevice::ReadOnly)) {
+                if (!m_warnedFallback) {
+                    m_warnedFallback = true;
+                    qWarning() << "[ndd-mdview] 警告：读不到编辑区实时内容，"
+                                  "退化到读磁盘文件（未保存的改动不会显示）";
+                }
                 out = QString::fromUtf8(f.readAll());
                 return true;
             }
