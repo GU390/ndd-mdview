@@ -849,6 +849,9 @@ public:
     // 自测：在预览里选中第 blockIndex 个块（验证「预览选区 -> 编辑区选中」）
     void testWebSelectionSync(int blockIndex);
 
+    // 自测：核对「第 N 行」在编辑区和预览里是不是同一段内容（行号映射）
+    void testLineMapping(int line);
+
     // 把渲染结果统计回读到日志（无头验证用：katex 元素数、公式出错数、正文长度）
     void logRenderStats();
 
@@ -2088,6 +2091,52 @@ void MdViewPanel::testWebSelectionSync(int blockIndex)
     h->Release();
 }
 
+// 自测：核对「第 N 行」在编辑区和预览里是不是同一段内容。
+// 行号映射一旦错位，「选区同步」就会把左边的第 N 行和右边的另一段配成一对 ——
+// 用户看到的就是「左右对不上」。这里把两边第 N 行的文本都打出来对照。
+void MdViewPanel::testLineMapping(int line)
+{
+    if (!m_view)
+        return;
+
+    // 编辑区这边：取当前全文，切出第 line 行
+    QString editorLine;
+    {
+        QString all;
+        if (readCurrentText(all)) {
+            const QStringList ls = all.split(QLatin1Char('\n'));
+            if (line >= 1 && line <= ls.size())
+                editorLine = ls.at(line - 1).trimmed();
+        }
+    }
+
+    // 预览那边：找 data-line == line 的块，打印它的文本
+    const QString js = QStringLiteral(
+        "(function(){"
+        " var els = document.querySelectorAll('#md [data-line]');"
+        " var hit = [];"
+        " for (var i = 0; i < els.length; i++){"
+        "   var a = parseInt(els[i].getAttribute('data-line'), 10);"
+        "   var b = parseInt(els[i].getAttribute('data-line2'), 10) || a;"
+        "   if (a <= %1 && b >= %1) { hit.push(els[i]); }"
+        " }"
+        " if (!hit.length) { return 'no-block-for-line-%1'; }"
+        " var t = (hit[0].innerText || '').replace(/\\s+/g, ' ').trim();"
+        " return 'blocks=' + hit.length + ' text=' + t.slice(0, 40);"
+        "})()").arg(line);
+    ExecScriptHandler* h = new ExecScriptHandler(
+        [editorLine](HRESULT code, LPCWSTR result) {
+            if (FAILED(code) || result == nullptr) {
+                qWarning() << "[ndd-mdview] 行号映射: 预览侧取回失败";
+                return;
+            }
+            qWarning() << "[ndd-mdview] 行号映射: 编辑区 =" << editorLine
+                       << "  ||  预览 =" << QString::fromWCharArray(result);
+        });
+    m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), h);
+    h->Release();
+}
+
 void MdViewPanel::logRenderStats()
 {
     if (!m_view)
@@ -2473,6 +2522,18 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
             if (ctl->panel)
                 ctl->panel->testWebSelectionSync(3);
         });
+    }
+
+    // 环境变量自测行号映射：NDD_MDVIEW_TESTMAP=1
+    // 8 秒后核对第 1/3/5 行在左右两边是不是同一段内容。
+    if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTMAP")) {
+        const int lines[] = { 1, 3, 5 };
+        for (int i = 0; i < 3; ++i) {
+            QTimer::singleShot(8000 + i * 700, ctl, [ctl, ln = lines[i]]() {
+                if (ctl->panel)
+                    ctl->panel->testLineMapping(ln);
+            });
+        }
     }
 
     return 0;
