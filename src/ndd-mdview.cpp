@@ -1025,6 +1025,8 @@ private:
     qint64 m_selSuppressUntil = 0;
     bool m_probed = false;
     bool m_routeLogged = false;
+    // v1.8：只读文档时跳过宿主 getCurEdit 回调（否则宿主会响铃），换文档后允许再提示一次
+    bool m_roSkipLogged = false;
     bool m_warnedFallback = false;
     MdSettings m_settings;
     HWND m_hwnd = nullptr;
@@ -1980,17 +1982,38 @@ void MdViewPanel::pollNow()
 
 bool MdViewPanel::readCurrentText(QString& out)
 {
-    // 候选 1：宿主给的 getCurEdit 仿函数
+    // 候选 2 先算：Qt 对象树里认 className == "ScintillaEditView"
+    QWidget* ed = FindCurrentEditor(m_host.data());
+
+    // ⚠️ v1.8：只读文档**不能**调宿主的 getCurEdit 回调。
+    //    官方回调落到宿主 CCNotePad::getCurEditView()，它对只读文档会：
+    //      ui.statusBar->showMessage("The ReadOnly document does not allow this operation.");
+    //      QApplication::beep();          <-- 响铃
+    //      return nullptr;
+    //    我们每个刷新周期都调一次 ⇒ 只读文档上会周期性地「滴」一声、状态栏反复刷提示。
+    //    宿主自己的内置 Markdown 预览正是为此绕开了 getCurEditView()
+    //    （源码注释原话：「与 getCurEditView() 相同的取法，但不做只读拦截」）。
+    //    所以自己先判只读：只读就直接用树里的指针，不去碰宿主回调；
+    //    非只读才走官方回调（保住「当前标签页」语义）。
+    bool edReadOnly = false;
+    if (ed != nullptr && m_isROFn != nullptr)
+        SafeSciBool(m_isROFn, reinterpret_cast<QsciScintilla*>(ed), &edReadOnly);
+
+    // 候选 1：宿主给的 getCurEdit 仿函数（只读时跳过，见上）
     QsciScintilla* fromHost = nullptr;
-    if (m_getCurEdit)
+    if (!edReadOnly && m_getCurEdit)
         fromHost = m_getCurEdit(m_host.data());
 
-    // 候选 2：Qt 对象树里认 className == "ScintillaEditView"
-    QWidget* ed = FindCurrentEditor(m_host.data());
+    if (edReadOnly && !m_roSkipLogged) {
+        m_roSkipLogged = true;
+        qWarning() << "[ndd-mdview] 当前文档只读：已跳过宿主 getCurEdit 回调"
+                      "（否则宿主会响铃并往状态栏刷提示）";
+    }
 
     // 事件驱动的信号要挂在「当前」编辑区上
     if (ed != m_lastEditor.data()) {
         m_lastEditor = ed;
+        m_roSkipLogged = false;      // 换文档后允许再提示一次
         connectEditor(ed);
         setupScrollSync(ed);
     }
@@ -2437,7 +2460,7 @@ NDD_EXPORT bool NDD_PROC_IDENTIFY(NDD_PROC_DATA* pProcData)
     pProcData->m_strComment = QString::fromUtf8(u8"在编辑区右侧渲染 Markdown，"
                                                 u8"支持公式（KaTeX），"
                                                 u8"基于 Microsoft Edge WebView2");
-    pProcData->m_version = QString::fromUtf8(u8"v1.7");
+    pProcData->m_version = QString::fromUtf8(u8"v1.8");
     pProcData->m_auther = QString::fromUtf8(u8"ndd-mdview");
     pProcData->m_menuType = 1;   // 二级菜单，宿主把 m_rootMenu 交给我们
     return true;
@@ -2554,7 +2577,7 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
             ctl->host ? ctl->host.data() : nullptr,
             QStringLiteral("Markdown 预览 (WebView2)"),
             QStringLiteral(
-                "Notepad-- 插件 · v1.7\n\n"
+                "Notepad-- 插件 · v1.8\n\n"
                 "在编辑区右侧用 Microsoft Edge WebView2 渲染 Markdown。\n"
                 "支持 GFM 表格、任务列表、围栏代码块、引用，"
                 "以及 $...$ / $$...$$ 公式（KaTeX）。\n\n"
@@ -2562,7 +2585,8 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
                 "也可在「自动更新间隔」里改成固定轮询，适合超大文件。\n\n"
                 "滚动同步、选区同步都可以单独开关。\n\n"
                 "取文依赖宿主 qscintilla 导出的 QsciScintilla::text()。\n"
-                "找不到时会退化成读磁盘文件（看不到未保存的改动）。"));
+                "找不到时会退化成读磁盘文件（看不到未保存的改动）。\n\n"
+                "v1.8：只读文档不再触发宿主的只读拦截（不响铃、不刷状态栏）。"));
     });
 
     // 环境变量自动打开面板：NDD_MDVIEW_AUTOSHOW=1
