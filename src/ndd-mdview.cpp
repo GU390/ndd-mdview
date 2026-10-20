@@ -66,6 +66,7 @@
 #include <QKeyEvent>
 
 #include <functional>
+#include <memory>
 #include <vector>
 #include <cstring>
 
@@ -319,6 +320,7 @@ static QWidget* FindCurrentEditor(QWidget* host)
 #define SCI_LINEFROMPOSITION  2166
 #define SCI_POSITIONFROMLINE  2167
 #define SCI_SETSEL            2160
+#define SCI_ENSUREVISIBLE     2232   // 把光标最小幅度滚进视野（不会跳）
 // 这版 Scintilla 已经没有 SCI_LINESCROLLTO 了（2168=SCI_LINESCROLL, 2169=SCI_SCROLLCARET），
 // 所以滚动只能用 QScintilla 的 firstVisibleLine()/setFirstVisibleLine()。
 
@@ -852,6 +854,9 @@ public:
     // 自测：核对「第 N 行」在编辑区和预览里是不是同一段内容（行号映射）
     void testLineMapping(int line);
 
+    // 自测：在网页里滚到第 line 行（模拟「用户自己滚网页」），宿主应把编辑区也滚过去
+    void testWebScroll(int line);
+
     // 把渲染结果统计回读到日志（无头验证用：katex 元素数、公式出错数、正文长度）
     void logRenderStats();
 
@@ -963,6 +968,10 @@ private:
     int  editorFirstVisibleLine();
     int  editorLineCount();
     void scrollEditorToLine(int line);
+    // 只做**最小滚动**：保证选区可见，但不把编辑区拽到区间第一行。
+    // （预览回传的是「整块」的行号范围，滚到区间头就是用户说的「跳 50~70 行」）
+    void ensureEditorSelectionVisible();
+    bool isPageReady() const { return m_pageReady; }
     void syncScrollFromEditor();
 
     QPointer<QWidget> m_host;
@@ -1273,6 +1282,20 @@ bool MdViewPanel::editorSelectionLines(int* l1, int* l2, bool* hasRange)
 }
 
 // 编辑区选区变了 -> 高亮预览里相交的块，并在预览里做真正的原生选区
+// 最小滚动：让选区可见，但视口尽量不动。
+// 用 SCI_ENSUREVISIBLE 而不是 setFirstVisibleLine(区间头) ——
+// 后者会把编辑区直接拽到区间第一行（一个 60 行的代码块 = 跳 60 行）。
+void MdViewPanel::ensureEditorSelectionVisible()
+{
+    if (m_sendFn == nullptr || m_scrollEditor.isNull())
+        return;
+    __try {
+        m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()),
+                 SCI_ENSUREVISIBLE, 0, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 void MdViewPanel::syncSelectionFromEditor()
 {
     if (!m_view || !m_pageReady || !m_settings.syncSelection)
@@ -1295,7 +1318,7 @@ void MdViewPanel::syncSelectionFromEditor()
                << (hasRange ? "（有选区）" : "（仅光标）") << "，推给网页";
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     // 自己推过去的选区，页面会再发一个 'S' 回来 —— 这是回声，要挡掉。
-    m_selSuppressUntil = now + 400;
+    m_selSuppressUntil = now + 1500;
     // 页面如果因为设了选区而滚动一下，那一下也不能回弹编辑区 ——
     // 否则「选一下就跳几十行」（网页视口高度 ≈ 50~70 行）。
     m_selScrollSuppressUntil = now + 400;
@@ -1344,6 +1367,8 @@ void MdViewPanel::onWebSelection(int l1, int l2)
     //    用户在预览里拖选时，浏览器常常同时发滚动事件（光标滚进视野），
     //    'L' 先到会把滚动窗口撑开，随后到的 'S' 就被一起误杀了 ——
     //    表现就是「右边选了，左边不动」。选区要用自己的回声窗口。
+    // 回声窗口放宽到 1.5s：页面忙的时候，selectionchange 会迟到
+    // （用户在大文档里选一下，回声隔了半秒才到，之前 400ms 就放行了）。
     if (now < m_selSuppressUntil)
         return;
     int gs = -1, ge = -1;
@@ -1354,8 +1379,10 @@ void MdViewPanel::onWebSelection(int l1, int l2)
         return;
     }
     m_scrollSuppressUntil = now + 250;
-    // 把编辑区滚到选中的位置，否则选中行在视口外，用户看不到「同步」了
-    scrollEditorToLine(l1 - 1);
+    // 让选区可见，但**最小幅度**地滚 —— 不能滚到区间第一行：
+    // 预览回传的是「整块」的行号范围（一个 60 行代码块就是 110..171），
+    // 滚到 110 正是用户报的「171 跳到 110」。
+    ensureEditorSelectionVisible();
     qWarning() << "[ndd-mdview] 选区同步: 网页行 " << l1 << ".." << l2
                << " -> 编辑区选中（位置 " << gs << ".." << ge << "，回读确认）";
 }
@@ -2160,6 +2187,19 @@ void MdViewPanel::testLineMapping(int line)
     h->Release();
 }
 
+// 自测：模拟用户在网页里滚动。
+// 直接调页面的 mdScrollToLine（不经过宿主的「推给网页」那条路），
+// 所以网页报回来的顶行在宿主看来就是「用户自己滚的」——
+// 宿主必须把编辑区滚过去（这正是 v1.5 修的那条被误吞的路径）。
+void MdViewPanel::testWebScroll(int line)
+{
+    if (!m_view)
+        return;
+    const QString js = QStringLiteral("window.mdScrollToLine(%1);").arg(line);
+    m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), nullptr);
+    qWarning() << "[ndd-mdview] 网页滚动自测: 已让网页滚到第" << line << "行";
+}
+
 void MdViewPanel::logRenderStats()
 {
     if (!m_view)
@@ -2524,6 +2564,26 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
         });
     }
 
+    // ⚠️ 自测钩子必须**等页面就绪**再跑：
+    //    页面没加载完时 m_pageReady=false，选区推送根本不会发出去，
+    //    测出来的「没跳」是假的（第一轮就踩过这个坑）。
+    auto whenReady = [](MdController* c, std::function<void(MdViewPanel*)> fn) {
+        auto tries = std::make_shared<int>(0);
+        QTimer* t = new QTimer(c);
+        t->setInterval(400);
+        QObject::connect(t, &QTimer::timeout, c, [c, t, fn, tries]() {
+            (*tries)++;
+            if (c->panel && c->panel->isPageReady()) {
+                t->stop();
+                fn(c->panel);
+            } else if (*tries > 100) {
+                t->stop();
+                qWarning() << "[ndd-mdview] 自测超时：页面一直没就绪";
+            }
+        });
+        t->start();
+    };
+
     // 环境变量自测选区同步：NDD_MDVIEW_TESTSEL=1
     if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTSEL")) {
         // NDD_MDVIEW_TESTSEL=5   -> 选第 5..6 行
@@ -2531,25 +2591,25 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
         const int tsel = qEnvironmentVariableIntValue("NDD_MDVIEW_TESTSEL");
         const int l1 = tsel > 0 ? tsel : 5;
         const int l2 = tsel > 0 ? tsel : 6;
-        QTimer::singleShot(8000, ctl, [ctl, l1, l2]() {
-            if (ctl->panel)
-                ctl->panel->testSelectionSync(l1, l2);
-        });
-        // 选区是 100ms 轮询发现的，等 1.5s 再取一次渲染统计，
-        // 这时 sel= 就是「编辑区选区 -> 预览高亮」的落地证据。
-        QTimer::singleShot(9500, ctl, [ctl]() {
-            if (ctl->panel)
-                ctl->panel->logRenderStats();
+        whenReady(ctl, [l1, l2](MdViewPanel* p) {
+            p->testSelectionSync(l1, l2);
+            // 选区是 100ms 轮询发现的，等 1.5s 再取一次渲染统计，
+            // 这时 sel= 就是「编辑区选区 -> 预览高亮」的落地证据。
+            QTimer::singleShot(1500, p, [p]() { p->logRenderStats(); });
         });
     }
 
     // 环境变量自测选区同步（反向：预览选区 -> 编辑区选中）：NDD_MDVIEW_TESTSELWEB=1
     // 选第 3 个块（"## 2. 块级公式"），编辑区应该选中第 8 行。
     if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTSELWEB")) {
-        QTimer::singleShot(8000, ctl, [ctl]() {
-            if (ctl->panel)
-                ctl->panel->testWebSelectionSync(3);
-        });
+        whenReady(ctl, [](MdViewPanel* p) { p->testWebSelectionSync(3); });
+    }
+
+    // 环境变量自测「用户滚网页」：NDD_MDVIEW_TESTSCROLL=200
+    // 模拟用户自己滚动网页，宿主必须把编辑区也滚过去。
+    if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTSCROLL")) {
+        const int tline = qEnvironmentVariableIntValue("NDD_MDVIEW_TESTSCROLL");
+        whenReady(ctl, [tline](MdViewPanel* p) { p->testWebScroll(tline); });
     }
 
     // 环境变量自测行号映射：NDD_MDVIEW_TESTMAP=1
