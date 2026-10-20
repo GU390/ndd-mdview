@@ -1008,6 +1008,9 @@ private:
     int m_lastWebLine = -1;
     int m_lastSelL1 = 0;
     int m_lastSelL2 = 0;
+    // 推给网页的选区区间（1 基；用来认「回声」）
+    int m_pushedSelL1 = 0;
+    int m_pushedSelL2 = 0;
     qint64 m_scrollSuppressUntil = 0;
     // 滚动回声判定（要精确，见 onWebScroll）：
     //   上次推给网页的目标行 + 推送时刻；网页滚完报回来的行跟它对得上 => 是回声。
@@ -1326,6 +1329,12 @@ void MdViewPanel::syncSelectionFromEditor()
                << (hasRange ? "（有选区）" : "（仅光标）") << "，推给网页";
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     // 自己推过去的选区，页面会再发一个 'S' 回来 —— 这是回声，要挡掉。
+    // 靠**内容**认，不靠时间：回声报回来的区间是「包含」我们推的区间的那一块
+    // （页面里选区是按块做的），所以「包含 ⇒ 回声」。
+    // 时间窗口两头都不准：回声迟到会被放行（编辑区被拽到块首），
+    // 用户在窗口内真的选了预览又会被误杀。
+    m_pushedSelL1 = qMin(l1, l2);
+    m_pushedSelL2 = qMax(l1, l2);
     m_selSuppressUntil = now + 1500;
     // 页面如果因为设了选区而滚动一下，那一下也不能回弹编辑区 ——
     // 否则「选一下就跳几十行」（网页视口高度 ≈ 50~70 行）。
@@ -1375,10 +1384,15 @@ void MdViewPanel::onWebSelection(int l1, int l2)
     //    用户在预览里拖选时，浏览器常常同时发滚动事件（光标滚进视野），
     //    'L' 先到会把滚动窗口撑开，随后到的 'S' 就被一起误杀了 ——
     //    表现就是「右边选了，左边不动」。选区要用自己的回声窗口。
-    // 回声窗口放宽到 1.5s：页面忙的时候，selectionchange 会迟到
-    // （用户在大文档里选一下，回声隔了半秒才到，之前 400ms 就放行了）。
-    if (now < m_selSuppressUntil)
+    // 回声判定（按内容，不按时间）：
+    // 网页回传的区间**包含**我们推给网页的那一段 ⇒ 是我们自己设选区引起的回声 ⇒ 丢掉。
+    // （用户真去选同一个块的情况也无所谓 —— 结果一样。）
+    if (m_pushedSelL1 > 0 &&
+        l1 <= m_pushedSelL1 && l2 >= m_pushedSelL2) {
+        qWarning() << "[ndd-mdview] 选区同步: 网页行" << l1 << ".." << l2
+                   << " 是本插件刚推过去的选区的回声，忽略";
         return;
+    }
     int gs = -1, ge = -1;
     if (!SciSelectLines(m_sendFn, reinterpret_cast<QsciScintilla*>(m_scrollEditor.data()), l1, l2,
                         &gs, &ge)) {
