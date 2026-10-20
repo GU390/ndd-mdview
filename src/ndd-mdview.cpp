@@ -1471,9 +1471,16 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "      })(names[i]);"
         "    }"
         "  })();"
+        /* 内容渲染完成 -> 告诉宿主一声（自测钩子要等这个） */
+        "  window.mdContentReady = function(){"
+        "    if (window.mdContentReadyDone) { return; }"
+        "    window.mdContentReadyDone = true;"
+        "    try { window.chrome.webview.postMessage('R'); } catch(e){}"
+        "  };"
         "  window.mdRender = function(text){"
         "    try{"
         "      document.getElementById('md').innerHTML = md.render(text);"
+        "      window.mdContentReady && window.mdContentReady();"
         "    }catch(e){"
         "      document.getElementById('md').textContent = 'Render error: '+e;"
         "    }"
@@ -1829,6 +1836,9 @@ void MdViewPanel::navigateToApp()
             return;
         if (s.startsWith(QLatin1Char('L'))) {
             self->onWebScroll(s.mid(1).toInt());
+        } else if (s.startsWith(QLatin1Char('R'))) {
+            // 页面内容渲染完了 -> 跑待办的自测
+            self->onContentReady();
         } else if (s.startsWith(QLatin1Char('S'))) {
             const QStringList p = s.mid(1).split(QLatin1Char(','));
             if (p.size() == 2)
@@ -2282,6 +2292,21 @@ class MdController : public QObject
 {
     Q_OBJECT
 public:
+    // 页面内容渲染完之后要跑的自测（等 'R' 消息再触发）
+    std::function<void(MdViewPanel*)> pendingTest;
+    bool pendingTestDone = false;
+
+    void onContentReady()
+    {
+        if (pendingTestDone || !pendingTest)
+            return;
+        pendingTestDone = true;
+        QTimer::singleShot(200, this, [this]() {
+            if (this->panel)
+                pendingTest(this->panel);
+        });
+    }
+
     explicit MdController(QObject* parent = nullptr) : QObject(parent) {}
 
     QPointer<QWidget> host;
@@ -2389,7 +2414,7 @@ NDD_EXPORT bool NDD_PROC_IDENTIFY(NDD_PROC_DATA* pProcData)
     pProcData->m_strComment = QString::fromUtf8(u8"在编辑区右侧渲染 Markdown，"
                                                 u8"支持公式（KaTeX），"
                                                 u8"基于 Microsoft Edge WebView2");
-    pProcData->m_version = QString::fromUtf8(u8"v1.6");
+    pProcData->m_version = QString::fromUtf8(u8"v1.7");
     pProcData->m_auther = QString::fromUtf8(u8"ndd-mdview");
     pProcData->m_menuType = 1;   // 二级菜单，宿主把 m_rootMenu 交给我们
     return true;
@@ -2506,7 +2531,7 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
             ctl->host ? ctl->host.data() : nullptr,
             QStringLiteral("Markdown 预览 (WebView2)"),
             QStringLiteral(
-                "Notepad-- 插件 · v1.6\n\n"
+                "Notepad-- 插件 · v1.7\n\n"
                 "在编辑区右侧用 Microsoft Edge WebView2 渲染 Markdown。\n"
                 "支持 GFM 表格、任务列表、围栏代码块、引用，"
                 "以及 $...$ / $$...$$ 公式（KaTeX）。\n\n"
@@ -2566,25 +2591,10 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
         });
     }
 
-    // ⚠️ 自测钩子必须**等页面就绪**再跑：
-    //    页面没加载完时 m_pageReady=false，选区推送根本不会发出去，
-    //    测出来的「没跳」是假的（第一轮就踩过这个坑）。
-    auto whenReady = [](MdController* c, std::function<void(MdViewPanel*)> fn) {
-        auto tries = std::make_shared<int>(0);
-        QTimer* t = new QTimer(c);
-        t->setInterval(400);
-        QObject::connect(t, &QTimer::timeout, c, [c, t, fn, tries]() {
-            (*tries)++;
-            if (c->panel && c->panel->isPageReady()) {
-                t->stop();
-                fn(c->panel);
-            } else if (*tries > 100) {
-                t->stop();
-                qWarning() << "[ndd-mdview] 自测超时：页面一直没就绪";
-            }
-        });
-        t->start();
-    };
+    // ⚠️ 自测钩子必须**等页面内容渲染出来**再跑：
+    //    页面脚本就位 ≠ 内容渲染完了 —— 块还没有 data-line，
+    //    推送/选择都落空，测出来的「没跳」是假的（踩过两轮这个坑）。
+    //    现在由页面渲染完后 postMessage('R') 来触发。
 
     // 环境变量自测选区同步：NDD_MDVIEW_TESTSEL=1
     if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTSEL")) {
@@ -2593,37 +2603,38 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
         const int tsel = qEnvironmentVariableIntValue("NDD_MDVIEW_TESTSEL");
         const int l1 = tsel > 0 ? tsel : 5;
         const int l2 = tsel > 0 ? tsel : 6;
-        whenReady(ctl, [l1, l2](MdViewPanel* p) {
+        ctl->pendingTest = [l1, l2](MdViewPanel* p) {
             p->testSelectionSync(l1, l2);
             // 选区是 100ms 轮询发现的，等 1.5s 再取一次渲染统计，
             // 这时 sel= 就是「编辑区选区 -> 预览高亮」的落地证据。
             QTimer::singleShot(1500, p, [p]() { p->logRenderStats(); });
-        });
+        };
     }
 
     // 环境变量自测选区同步（反向：预览选区 -> 编辑区选中）：NDD_MDVIEW_TESTSELWEB=1
     // 选第 3 个块（"## 2. 块级公式"），编辑区应该选中第 8 行。
     if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTSELWEB")) {
-        whenReady(ctl, [](MdViewPanel* p) { p->testWebSelectionSync(3); });
+        ctl->pendingTest = [](MdViewPanel* p) { p->testWebSelectionSync(3); };
     }
 
     // 环境变量自测「用户滚网页」：NDD_MDVIEW_TESTSCROLL=200
     // 模拟用户自己滚动网页，宿主必须把编辑区也滚过去。
     if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTSCROLL")) {
         const int tline = qEnvironmentVariableIntValue("NDD_MDVIEW_TESTSCROLL");
-        whenReady(ctl, [tline](MdViewPanel* p) { p->testWebScroll(tline); });
+        ctl->pendingTest = [tline](MdViewPanel* p) { p->testWebScroll(tline); };
     }
 
     // 环境变量自测行号映射：NDD_MDVIEW_TESTMAP=1
     // 8 秒后核对第 1/3/5 行在左右两边是不是同一段内容。
     if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTMAP")) {
-        const int lines[] = { 1, 3, 5 };
-        for (int i = 0; i < 3; ++i) {
-            QTimer::singleShot(8000 + i * 700, ctl, [ctl, ln = lines[i]]() {
-                if (ctl->panel)
-                    ctl->panel->testLineMapping(ln);
-            });
-        }
+        ctl->pendingTest = [](MdViewPanel* p) {
+            const int lines[] = { 1, 3, 5 };
+            for (int i = 0; i < 3; ++i) {
+                QTimer::singleShot(i * 700, p, [p, ln = lines[i]]() {
+                    p->testLineMapping(ln);
+                });
+            }
+        };
     }
 
     return 0;
