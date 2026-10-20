@@ -9,9 +9,15 @@
 ## 特性
 
 - **右侧停靠**，不是独立窗口；和编辑器同时可见、同时滚动。
-- **实时更新**：每 250 ms 轮询编辑区，内容变了就重渲染（只在预览可见时轮询）。
+- **实时更新**：默认**事件驱动** —— 直接监听编辑区的 `textChanged` 信号，
+  改一个字 120 ms 内就出现在预览里；空闲时**完全不轮询，CPU 占用 0.00%**。
+- **刷新率可调**：菜单里能切成 500 毫秒 / 1 秒 / 2 秒 / 5 秒固定轮询，
+  超大文件建议调慢。
 - **完整 Markdown 语法**：GFM 表格、任务列表、围栏代码块、引用、链接自动识别、
   标题层级、水平线 —— 全部由 [markdown-it 14.1.0](https://github.com/markdown-it/markdown-it) 渲染。
+- **公式渲染**：`$...$` 行内公式和 `$$...$$` 块级公式，用
+  [KaTeX 0.16.11](https://katex.org) 排版；公式里夹中文也能正常显示。
+- **省内存**：隐藏面板时可释放 WebView2（省约 120 MB），再次打开自动重建。
 - **样式干净**：类 GitHub 的浅色排版，中文友好（微软雅黑）。
 - **不链接 qscint**：取文本只借宿主导出的一个符号，不引入 qscintilla 的类布局依赖（见下）。
 - **不崩宿主**：取文调用外面裹了 SEH，任何意外都只跳过这一轮，不影响宿主。
@@ -30,9 +36,41 @@
 
 ## 使用
 
+菜单「插件」→「Markdown 实时预览 (WebView2)」→
+
+| 菜单项 | 说明 |
+|---|---|
+| 显示预览面板 | 开/关右侧预览（勾选状态跟着面板显隐走） |
+| 立即刷新 | 手动重取一次文本并重渲染 |
+| 自动更新间隔 | 实时（事件驱动，默认）/ 500 毫秒 / 1 秒 / 2 秒 / 5 秒 |
+| 公式渲染 (KaTeX) | 开关 `$...$` / `$$...$$` 公式排版 |
+| 隐藏面板时释放内存 | 隐藏面板时把 WebView2 释放掉（省约 120 MB），再次打开自动重建 |
+| 重新加载预览页 | 重新加载网页（改了公式设置后会自动重载） |
+| 关于 | 版本与说明 |
+
 - 面板在主窗口右侧，可以像普通停靠窗格一样拖动、浮动、调整宽度。
 - 切换到别的文件 / 别的标签页，预览会自动跟着当前编辑区走。
 - 预览不可见时**不轮询**，不吃 CPU。
+- 设置保存在 `%APPDATA%\Notepad--\ndd-mdview.ini`。
+
+### 环境变量（调试用）
+
+| 变量 | 作用 |
+|---|---|
+| `NDD_MDVIEW_AUTOSHOW=1` | 启动 3 秒后自动打开预览面板 |
+| `NDD_MDVIEW_AUTOHIDE=1` | 启动 10 秒后自动隐藏面板（用来验证释放内存那条路径） |
+
+## 性能实测
+
+本机（i3-9100 / 8 GB 单通道 / Win10），面板打开、什么都不动：
+
+| 状态 | Notepad-- 自身 | WebView2 | 合计内存 |
+|---|---|---|---|
+| 面板打开（实时模式，空闲） | **CPU 0.00%** / 45.0 MB | 4 进程 / 117.7 MB | 162.8 MB |
+| 隐藏并释放 WebView2 之后 | **CPU 0.00%** / 45.0 MB | 0 进程 / 0 MB | **45.0 MB**（↓72%） |
+
+CPU 能到 0.00% 是因为改成了事件驱动 —— 旧版每 250 ms 轮询一次取全文，
+即使一个字没改也在不停复制文档。空闲时 WebView2 自己也不耗 CPU。
 
 ## 技术说明
 
@@ -113,6 +151,38 @@ mov rax, r14          ; 返回槽地址放 RAX
 `window.mdUpdate('...')`。base64 只含 `A-Za-z0-9+/=`，
 不用跟 JS 字符串转义规则较劲。JS 侧 `atob` + `TextDecoder('utf-8')` 解回来。
 
+### 公式渲染（KaTeX）
+
+- 引擎：[KaTeX 0.16.11](https://katex.org)（MIT），CI 里从 npm 拉，版本钉死。
+- 排版插件是自己写的精简版（`assets/mdview-math.js`，思路参考
+  markdown-it-katex）：行内 `$...$`、块级 `$$...$$`，并处理了
+  「`$5 和 $10` 不该被当成公式」「`\$100` 转义」这些边界。
+  公式语法出错时退回显示原始 LaTeX，不影响其它内容渲染。
+- 资源怎么送到网页：KaTeX 的 js / css / 20 个 woff2 字体编译进 DLL，
+  首次使用时解到 `%TEMP%\ndd-mdview\katex-0.16.11\`，再用 WebView2 的
+  **虚拟主机映射**（`https://mdview.local/` → 该目录）暴露给网页。
+  这样页面本体很小，字体**按需加载**（用到哪个字形才下载哪个字体文件），
+  不会 20 个字体全进内存。
+
+### 更新是怎么触发的
+
+- 默认**事件驱动**：用字符串式 `QObject::connect(editor, SIGNAL(textChanged()), ...)`
+  连宿主的编辑区信号 —— 不需要 `QsciScintilla` 的类定义，跨模块也安全。
+  信号本身很密（每个按键都发），所以用 120 ms 的单次定时器合并成一次推送。
+- 另有一个 1 秒的**看门狗**：编辑区可能是插件加载之后才建好的（那时信号还没连上），
+  切换标签页 / 换文件时对象也会变。看门狗只做「重新定位 + 比对文本」，
+  文本没变就不推送，所以不会产生 markdown-it 重渲染的开销。
+- 也可以在菜单里切成固定间隔轮询（500 ms ~ 5 s），适合超大文件。
+
+### 文本怎么推给网页
+
+优先用 WebView2 的 **原生消息通道**（`PostWebMessageAsString`）：
+直接把文本字符串发给网页，省掉 UTF-8 转换、base64 编码、JS 表达式拼装与再解析。
+
+页面加载完后宿主会问一句 `window.mdvSupportsPost`；页面答不上来（比如
+`window.chrome.webview` 不可用）就自动退回 **base64 + ExecuteScript**，
+功能不受影响，只是多几次拷贝。
+
 ### 面板怎么嵌
 
 `QDockWidget` 挂到 `Qt::RightDockWidgetArea`。宿主主窗口是
@@ -144,11 +214,23 @@ Microsoft.Web.WebView2 1.0.2903.40。
 python -m pip install aqtinstall
 python -m aqt install-qt windows desktop 5.15.2 win64_msvc2019_64 -m qtbase --outputdir C:\Qt
 
-# 3) 编
+# 3) 取 KaTeX 资源（公式渲染用，CI 里也是这一步）
+npm pack katex@0.16.11
+tar -xzf katex-0.16.11.tgz
+mkdir -p assets\fonts
+copy package\dist\katex.min.js assets\
+copy package\dist\katex.min.css assets\
+copy package\dist\fonts\*.woff2 assets\fonts\
+# 再照着 assets\ 里的文件生成一份 assets\katex.qrc（见 build.yml 的 "Fetch KaTeX assets"）
+
+# 4) 编
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH=C:\Qt\5.15.2\msvc2019_64
 cmake --build build --config Release
 # 产物：build\bin\Release\ndd-mdview.dll
 ```
+
+> 不取 KaTeX 也能编（`assets\*.qrc` 是 glob 的，没有 katex.qrc 就不带公式资源），
+> 只是公式渲染不可用。
 
 `.github/workflows/build.yml` 就是把这套流程搬到 `windows-2022` runner 上跑。
 
@@ -161,7 +243,12 @@ cmake --build build --config Release
 - 取文依赖宿主 qscintilla 导出表里的 `QsciScintilla::text()`。宿主哪天把这个
   符号改名/去掉，插件会退化成「读磁盘上的文件」—— 能出内容，但看不到未保存的改动，
   停靠窗格标题会提示。日志里会明确写出走了哪条路。
-- 超大文件（几十 MB）每次轮询都要整篇取一遍，会有可感知的开销。
+- 公式排版用 KaTeX，只支持 TeX 常见语法；需要 Mermaid 流程图 / 折叠区块之类
+  得再接对应的前端库。
+- 超大文件每次更新都要整篇取一遍、并让 markdown-it 整篇重排，会有可感知开销；
+  这时把「自动更新间隔」调慢一些。
+- 打开面板会拉起 WebView2（4 个进程，约 120 MB）。介意的话打开
+  「隐藏面板时释放内存」，隐藏后总内存回到 45 MB。
 
 ## 许可
 
