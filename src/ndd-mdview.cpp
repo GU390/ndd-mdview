@@ -33,6 +33,7 @@
 #include <QtGlobal>
 #include <QWidget>
 #include <QObject>
+#include <QApplication>
 #include <QAction>
 #include <QMenu>
 #include <QTimer>
@@ -105,6 +106,11 @@ public:
 // MSVC x64：类类型按值返回走隐藏返回缓冲区（sret，RCX），
 // 第一个显式/隐式实参进 RDX。成员函数与同签名的自由函数寄存器布局一致，
 // 所以用自由函数指针调用是安全的。
+//
+// 实测（dump qmyedit_qt5.dll 的机器码确认）：
+//   ?text@QsciScintilla@@QEBA?AVQString@@XZ
+//     +1a  4c 8b f2   mov r14, rdx   ← this = RDX
+//     +29  48 8b e9   mov rbp, rcx   ← sret = RCX
 typedef QString (*SciTextFn)(QsciScintilla* self);
 
 // 宿主 qscintilla 那个 DLL 里 text() 的修饰名
@@ -159,6 +165,70 @@ static SciTextFn ResolveSciTextFn()
     if (psapi)
         FreeLibrary(psapi);
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+//  定位当前编辑区
+//
+//  为什么不直接用宿主给的 getCurEdit 仿函数：
+//    实测（v1.0 第一版）用它拿到的指针是垃圾，调用 text() 直接在
+//    qmyedit_qt5.dll 的 SendScintilla 里访问违例（0xc0000005，崩宿主）。
+//    寄存器约定已用机器码核对过是对的（sret=RCX / this=RDX），
+//    所以问题出在那个指针本身 —— 跨模块 std::function 的可靠性存疑，
+//    不敢再依赖。
+//
+//  改用 Qt 自己的对象树定位：宿主主窗口 → findChildren<QWidget*>() →
+//  用 metaObject()->className() 认 "ScintillaEditView"。
+//  这条路全是 Qt 自己的 API（metaObject 是虚函数，vtable 在宿主 EXE 里，
+//  调用完全安全）。
+//
+//  关键前提：ScintillaEditView : QsciScintilla : QsciScintillaBase
+//  : QAbstractScrollArea : QFrame : QWidget : QObject —— 全是单继承，
+//  所以 **所有基类子对象的偏移都是 0**：
+//  QWidget* == QsciScintilla* == 同一个地址。
+//  于是拿 QWidget* 直接当 QsciScintilla* 传给 text() 是对的。
+// ---------------------------------------------------------------------------
+static QWidget* FindCurrentEditor(QWidget* host)
+{
+    if (host == nullptr)
+        return nullptr;
+
+    QWidget* focus = QApplication::focusWidget();
+    QWidget* best = nullptr;
+    long bestArea = -1;
+
+    const QList<QWidget*> kids = host->findChildren<QWidget*>();
+    for (int i = 0; i < kids.size(); ++i) {
+        QWidget* w = kids.at(i);
+        const QMetaObject* mo = w->metaObject();
+        if (mo == nullptr)
+            continue;
+        if (qstrcmp(mo->className(), "ScintillaEditView") != 0)
+            continue;
+        if (!w->isVisible())
+            continue;
+        if (w == focus)
+            return w;                       // 有焦点的优先
+        const QRect r = w->rect();
+        const long area = (long)r.width() * (long)r.height();
+        if (area > bestArea) {
+            bestArea = area;
+            best = w;
+        }
+    }
+    return best;
+}
+
+// 调 text() 时兜一层 SEH：万一指针不对，别把宿主带崩。
+// 函数里不放任何需要回卷的 C++ 对象（否则 MSVC 会报 C2712）。
+static bool SafeSciText(SciTextFn fn, QsciScintilla* self, QString* out)
+{
+    __try {
+        *out = fn(self);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 // 轮询间隔（毫秒）
@@ -473,6 +543,7 @@ private:
     QPointer<QDockWidget> m_dock;
     std::function<QsciScintilla*(QWidget*)> m_getCurEdit;
     SciTextFn m_textFn = nullptr;
+    QWidget* m_lastEditor = nullptr;
     HWND m_hwnd = nullptr;
     QString m_pluginDir;
     HRESULT m_coInitResult = S_OK;
@@ -761,7 +832,7 @@ void MdViewPanel::pushCurrentText()
 
 void MdViewPanel::pollNow()
 {
-    if (!m_host || !m_getCurEdit)
+    if (!m_host)
         return;
 
     // 顺手再对一次 bounds：停靠/浮动时 Qt 可能不触发 resizeEvent
@@ -775,13 +846,23 @@ void MdViewPanel::pollNow()
             return;
     }
 
-    // 宿主的 getCurEditView 必须每次重新取 —— 切标签页后编辑区对象会换
-    QsciScintilla* ed = m_getCurEdit(m_host.data());
+    // 用 Qt 对象树定位当前编辑区（不走宿主的 std::function 仿函数）
+    QWidget* ed = FindCurrentEditor(m_host.data());
     if (ed == nullptr)
         return;
+    if (ed != m_lastEditor) {
+        m_lastEditor = ed;
+        qWarning() << "[ndd-mdview] 当前编辑区 =" << (void*)ed
+                   << " class=" << ed->metaObject()->className()
+                   << " size=" << ed->width() << "x" << ed->height();
+    }
 
-    // 调宿主导出的 QsciScintilla::text()（非虚成员，this 原样传下去）
-    const QString text = m_textFn(ed);
+    QString text;
+    if (!SafeSciText(m_textFn, reinterpret_cast<QsciScintilla*>(ed), &text)) {
+        qWarning() << "[ndd-mdview] 调用 QsciScintilla::text() 发生访问违例，"
+                      "编辑器指针=" << (void*)ed << "，本轮跳过";
+        return;
+    }
     if (text == m_currentText)
         return;
 
