@@ -796,6 +796,7 @@ private:
     QString m_lastText;
     QString m_status;
     bool m_pageReady = false;
+    bool m_usePostMessage = false;   // 页面是否支持原生消息通道
 };
 
 // --- 面板实现 ---------------------------------------------------------------
@@ -927,6 +928,20 @@ QString MdViewPanel::buildHtml(const QString& mdJs) const
         "      document.getElementById('md').textContent = 'Render error: '+e;"
         "    }"
         "  };"
+        /* 能不能用原生消息通道（宿主 PostWebMessageAsString）？
+           页面加载完宿主会问一句 window.mdvSupportsPost，
+           答 1 就走原生通道（省掉 base64 编码和三次拷贝），
+           答 0 宿主就退回 base64 + ExecuteScript。 */
+        "  window.mdvSupportsPost = false;"
+        "  try{"
+        "    if (window.chrome && window.chrome.webview &&"
+        "        window.chrome.webview.addEventListener) {"
+        "      window.chrome.webview.addEventListener('message', function(e){"
+        "        window.mdRender(e.data);"
+        "      });"
+        "      window.mdvSupportsPost = true;"
+        "    }"
+        "  }catch(e){ window.mdvSupportsPost = false; }"
         "})();";
 
     // KaTeX 资源：js/css 从虚拟主机 https://mdview.local/ 取，
@@ -1122,7 +1137,23 @@ void MdViewPanel::navigateToApp()
         self->m_pageReady = true;
         self->setStatus(QStringLiteral("page ok"));
         self->m_lastText.clear();
-        self->pushCurrentText();
+
+        // 问页面支不支持原生消息通道（省掉 base64 编码和几次拷贝）。
+        // 页面答不上来就退回 base64 + ExecuteScript，不影响功能。
+        ExecScriptHandler* probe = new ExecScriptHandler([self](HRESULT code, LPCWSTR result) {
+            if (!self)
+                return;
+            if (SUCCEEDED(code) && result != nullptr) {
+                const QString r = QString::fromWCharArray(result);
+                self->m_usePostMessage = r.contains(QStringLiteral("YES"));
+            }
+            qWarning() << "[ndd-mdview] 推送通道 ="
+                       << (self->m_usePostMessage ? QStringLiteral("PostWebMessage")
+                                                   : QStringLiteral("base64+ExecuteScript"));
+            self->pushCurrentText();
+        });
+        self->m_view->ExecuteScript(L"window.mdvSupportsPost ? 'YES' : 'NO'", probe);
+        probe->Release();
     });
     HRESULT hr = m_view->add_NavigationCompleted(navHandler, &token);
     navHandler->Release();
@@ -1176,17 +1207,29 @@ void MdViewPanel::pushCurrentText()
     m_lastText = m_currentText;
     setStatus(QStringLiteral("实时 | %1 字符").arg(m_currentText.size()));
 
-    // 直接把文本字符串推给网页：省掉 base64 编码、JS 表达式拼装与再解析
-    HRESULT hr = m_view->PostWebMessageAsString(
-        reinterpret_cast<LPCWSTR>(m_currentText.utf16()));
-    if (FAILED(hr)) {
+    if (m_usePostMessage) {
+        // 原生消息通道：直接把文本字符串推给网页，
+        // 省掉 UTF-8 转换、base64 编码、JS 表达式拼装与再解析。
+        HRESULT hr = m_view->PostWebMessageAsString(
+            reinterpret_cast<LPCWSTR>(m_currentText.utf16()));
+        if (SUCCEEDED(hr))
+            return;
         qWarning() << "[ndd-mdview] PostWebMessageAsString 失败, hr=0x" << (quint32)hr;
-        // 退回老的 base64 + ExecuteScript 方式
-        const QByteArray payload = m_currentText.toUtf8().toBase64();
-        const QString js = QStringLiteral("window.mdUpdate('")
-            + QString::fromLatin1(payload) + QStringLiteral("')");
-        m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), nullptr);
+        m_usePostMessage = false;   // 退回 base64 通道
     }
+
+    // 兜底通道：base64 + ExecuteScript
+    const QByteArray payload = m_currentText.toUtf8().toBase64();
+    const QString js = QStringLiteral("window.mdUpdate('")
+        + QString::fromLatin1(payload) + QStringLiteral("')");
+    ExecScriptHandler* execHandler = new ExecScriptHandler(
+        [](HRESULT code, LPCWSTR) {
+            if (FAILED(code))
+                qWarning() << "[ndd-mdview] ExecuteScript failed, hr=0x"
+                           << (quint32)code;
+        });
+    m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), execHandler);
+    execHandler->Release();
 }
 
 void MdViewPanel::pollNow()
