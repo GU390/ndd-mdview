@@ -1779,10 +1779,11 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
                 return;
             }
             qWarning() << "[ndd-mdview] TESTTYPE: 注入按键";
+            ed->setFocus();
             QKeyEvent press(QEvent::KeyPress, Qt::Key_Z, Qt::NoModifier, QStringLiteral("Z"));
-            QApplication::postEvent(ed, &press);
+            QApplication::sendEvent(ed, &press);
             QKeyEvent release(QEvent::KeyRelease, Qt::Key_Z, Qt::NoModifier, QStringLiteral("Z"));
-            QApplication::postEvent(ed, &release);
+            QApplication::sendEvent(ed, &release);
         });
     }
 
