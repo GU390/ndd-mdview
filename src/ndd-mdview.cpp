@@ -1,6 +1,6 @@
 // ============================================================================
 //  ndd-mdview.cpp
-//  Notepad-- 插件：内嵌 Microsoft Edge WebView2 的 Markdown 实时预览
+//  Notepad-- 插件：内嵌 Microsoft Edge WebView2 的 Markdown 预览
 //
 //  设计要点
 //  --------
@@ -814,8 +814,8 @@ public:
         m_status = s;
         if (m_dock) {
             m_dock->setWindowTitle(m_status.isEmpty()
-                                       ? QStringLiteral("Markdown 实时预览")
-                                       : QStringLiteral("Markdown 实时预览 | ") + m_status);
+                                       ? QStringLiteral("Markdown 预览")
+                                       : QStringLiteral("Markdown 预览 | ") + m_status);
         }
     }
 
@@ -827,6 +827,9 @@ public:
 
     // 自测：把编辑区滚到某行，再读回网页当前的行号（验证滚动同步）
     void testScrollSync(int line);
+
+    // 自测：在编辑区里选中 l1..l2 行（验证选区同步）
+    void testSelectionSync(int l1, int l2);
 
     // 把渲染结果统计回读到日志（无头验证用：katex 元素数、公式出错数、正文长度）
     void logRenderStats();
@@ -1023,12 +1026,12 @@ QString MdViewPanel::modeLabel() const
     return QStringLiteral("每 %1 秒").arg(ms / 1000);
 }
 
-// 标题统一格式：Markdown 实时预览 | 模式 | 字符数
+// 标题统一格式：Markdown 预览 | 模式 | 字符数
 void MdViewPanel::updateTitle()
 {
     if (!m_dock)
         return;
-    m_dock->setWindowTitle(QStringLiteral("Markdown 实时预览 | %1 | %2 字符")
+    m_dock->setWindowTitle(QStringLiteral("Markdown 预览 | %1 | %2 字符")
                             .arg(modeLabel())
                             .arg(m_currentText.size()));
 }
@@ -1927,6 +1930,15 @@ void MdViewPanel::testScrollSync(int line)
     });
 }
 
+void MdViewPanel::testSelectionSync(int l1, int l2)
+{
+    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
+        return;
+    if (!SciSelectLines(m_sendFn, reinterpret_cast<QsciScintilla*>(m_scrollEditor), l1, l2))
+        return;
+    qWarning() << "[ndd-mdview] 选区自测: 已在编辑区选中第" << l1 << ".." << l2 << "行";
+}
+
 void MdViewPanel::logRenderStats()
 {
     if (!m_view)
@@ -2040,7 +2052,7 @@ public:
 
         QMainWindow* mw = host ? qobject_cast<QMainWindow*>(host.data()) : nullptr;
         if (mw) {
-            dock = new QDockWidget(QStringLiteral("Markdown 实时预览"), mw);
+            dock = new QDockWidget(QStringLiteral("Markdown 预览"), mw);
             dock->setObjectName(QStringLiteral("ndd_mdview_dock"));
             panel = new MdViewPanel(dock);
             panel->setHostWidget(host);
@@ -2062,7 +2074,7 @@ public:
             // 退化：不是 QMainWindow 就开独立顶层窗口
             panel = new MdViewPanel(nullptr);
             panel->setWindowFlags(Qt::Window);
-            panel->setWindowTitle(QStringLiteral("Markdown 实时预览"));
+            panel->setWindowTitle(QStringLiteral("Markdown 预览"));
             panel->resize(760, 900);
             panel->setHostWidget(host);
             panel->setTextSource(getCurEdit, isROFn, sendFn, textFn);
@@ -2109,11 +2121,11 @@ NDD_EXPORT bool NDD_PROC_IDENTIFY(NDD_PROC_DATA* pProcData)
     if (pProcData == nullptr)
         return false;
 
-    pProcData->m_strPlugName = QString::fromUtf8(u8"Markdown 实时预览 (WebView2)");
-    pProcData->m_strComment = QString::fromUtf8(u8"在编辑区右侧实时渲染 Markdown，"
+    pProcData->m_strPlugName = QString::fromUtf8(u8"Markdown 预览 (WebView2)");
+    pProcData->m_strComment = QString::fromUtf8(u8"在编辑区右侧渲染 Markdown，"
                                                 u8"支持公式（KaTeX），"
                                                 u8"基于 Microsoft Edge WebView2");
-    pProcData->m_version = QString::fromUtf8(u8"v1.1");
+    pProcData->m_version = QString::fromUtf8(u8"v1.4");
     pProcData->m_auther = QString::fromUtf8(u8"ndd-mdview");
     pProcData->m_menuType = 1;   // 二级菜单，宿主把 m_rootMenu 交给我们
     return true;
@@ -2228,14 +2240,15 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
     QObject::connect(actAbout, &QAction::triggered, ctl, [ctl]() {
         QMessageBox::information(
             ctl->host ? ctl->host.data() : nullptr,
-            QStringLiteral("Markdown 实时预览 (WebView2)"),
+            QStringLiteral("Markdown 预览 (WebView2)"),
             QStringLiteral(
-                "Notepad-- 插件 · v1.1\n\n"
-                "在编辑区右侧用 Microsoft Edge WebView2 实时渲染 Markdown。\n"
+                "Notepad-- 插件 · v1.4\n\n"
+                "在编辑区右侧用 Microsoft Edge WebView2 渲染 Markdown。\n"
                 "支持 GFM 表格、任务列表、围栏代码块、引用，"
                 "以及 $...$ / $$...$$ 公式（KaTeX）。\n\n"
                 "更新方式：默认事件驱动（编辑区一改就更新，120ms 合并），\n"
                 "也可在「自动更新间隔」里改成固定轮询，适合超大文件。\n\n"
+                "滚动同步、选区同步都可以单独开关。\n\n"
                 "取文依赖宿主 qscintilla 导出的 QsciScintilla::text()。\n"
                 "找不到时会退化成读磁盘文件（看不到未保存的改动）。"));
     });
@@ -2286,6 +2299,14 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
         QTimer::singleShot(8000, ctl, [ctl]() {
             if (ctl->panel)
                 ctl->panel->testScrollSync(40);
+        });
+    }
+
+    // 环境变量自测选区同步：NDD_MDVIEW_TESTSEL=1
+    if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTSEL")) {
+        QTimer::singleShot(8000, ctl, [ctl]() {
+            if (ctl->panel)
+                ctl->panel->testSelectionSync(5, 6);
         });
     }
 
