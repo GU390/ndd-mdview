@@ -1393,6 +1393,7 @@ public:
     QPointer<QDockWidget> dock;
     MdViewPanel* panel = nullptr;
     QString pluginDir;
+    QAction* actShow = nullptr;      // 「显示预览面板」勾选项，用来同步状态
     std::function<QsciScintilla*(QWidget*)> getCurEdit;
     SciBoolFn isROFn = nullptr;
     SciSendFn sendFn = nullptr;
@@ -1433,6 +1434,11 @@ public:
             mw->addDockWidget(Qt::RightDockWidgetArea, dock);
             panel->start(pluginDir);
             dock->hide();
+            // 菜单里的勾选状态跟着面板显隐走
+            if (actShow) {
+                QObject::connect(dock, &QDockWidget::visibilityChanged,
+                                 actShow, &QAction::setChecked);
+            }
         } else {
             // 退化：不是 QMainWindow 就开独立顶层窗口
             panel = new MdViewPanel(nullptr);
@@ -1526,18 +1532,18 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
     QMenu* menu = pProcData->m_rootMenu;
     QAction* actShow = menu->addAction(QStringLiteral("显示预览面板"));
     actShow->setCheckable(true);
+    ctl->actShow = actShow;
     QObject::connect(actShow, &QAction::triggered, ctl, [ctl, actShow]() {
+        // 目标状态要先记下来：ensure() 里会建面板并 hide()，
+        // 那会触发 visibilityChanged 把勾选状态改回去。
+        const bool want = actShow->isChecked();
         ctl->ensure();
         if (ctl->dock) {
-            if (actShow->isChecked())
-                ctl->dock->show();
-            else
-                ctl->dock->hide();
+            ctl->dock->setVisible(want);
         } else if (ctl->panel) {
-            ctl->panel->setVisible(actShow->isChecked());
+            ctl->panel->setVisible(want);
         }
     });
-    actShow->setChecked(true);
 
     QAction* actRefresh = menu->addAction(QStringLiteral("立即刷新"));
     QObject::connect(actRefresh, &QAction::triggered, ctl, [ctl]() {
