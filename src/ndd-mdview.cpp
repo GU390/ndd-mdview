@@ -710,7 +710,7 @@ public:
                                      ICoreWebView2WebMessageReceivedEventArgs* args) override
     {
         LPWSTR msg = nullptr;
-        if (args != nullptr && SUCCEEDED(args->get_WebMessageAsString(&msg)) && msg != nullptr) {
+        if (args != nullptr && SUCCEEDED(args->TryGetWebMessageAsString(&msg)) && msg != nullptr) {
             const QString s = QString::fromWCharArray(msg);
             CoTaskMemFree(msg);
             m_fn(s);
@@ -1002,7 +1002,13 @@ void MdViewPanel::setupScrollSync(QWidget* editor)
         return;
 
     // 优先用编辑区自己的滚动条信号（事件驱动，零 CPU）
-    m_scrollBar = editor->findChild<QScrollBar*>(QString(), Qt::Vertical);
+    const QList<QScrollBar*> bars = editor->findChildren<QScrollBar*>();
+    for (int i = 0; i < bars.size(); ++i) {
+        if (bars.at(i)->orientation() == Qt::Vertical) {
+            m_scrollBar = bars.at(i);
+            break;
+        }
+    }
     if (m_scrollBar) {
         m_scrollConn = QObject::connect(m_scrollBar, &QScrollBar::valueChanged,
                                        this, [this](int) { syncScrollFromEditor(); });
