@@ -1044,7 +1044,7 @@ bool MdViewPanel::readCurrentText(QString& out)
             if (curLine && SafeSciInt(curLine, reinterpret_cast<QsciScintilla*>(ed), &line))
                 qWarning() << "[ndd-mdview] getCurrentLineNumber =" << line;
             else
-                qWarning() << "[ndd-mdview] getCurrentLineNumber -> 失败");
+                qWarning() << "[ndd-mdview] getCurrentLineNumber -> 失败";
             // 文件里的长度，用来和 text() 的长度对账
             const QString path = ed->property("filePath").toString();
             qWarning() << "[ndd-mdview] filePath =" << path;
