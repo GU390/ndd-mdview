@@ -729,6 +729,9 @@ public:
     // 立即刷新一次（菜单用）
     void refreshNow();
 
+    // 把渲染结果统计回读到日志（无头验证用：katex 元素数、公式出错数、正文长度）
+    void logRenderStats();
+
     // 设置变了：重新装载页面
     void reloadPage();
 
@@ -1197,6 +1200,7 @@ void MdViewPanel::navigateToApp()
                        << (self->m_usePostMessage ? QStringLiteral("PostWebMessage")
                                                    : QStringLiteral("base64+ExecuteScript"));
             self->pushCurrentText();
+            self->logRenderStats();
         });
         self->m_view->ExecuteScript(L"window.mdvSupportsPost ? 'YES' : 'NO'", probe);
         probe->Release();
@@ -1417,6 +1421,28 @@ bool MdViewPanel::readCurrentText(QString& out)
     }
 
     return false;
+}
+
+void MdViewPanel::logRenderStats()
+{
+    if (!m_view)
+        return;
+    ExecScriptHandler* h = new ExecScriptHandler(
+        [](HRESULT code, LPCWSTR result) {
+            if (FAILED(code) || result == nullptr) {
+                qWarning() << "[ndd-mdview] 渲染统计: 取回失败";
+                return;
+            }
+            qWarning() << "[ndd-mdview] 渲染统计:" << QString::fromWCharArray(result);
+        });
+    m_view->ExecuteScript(
+        L"(function(){var el=document.getElementById('md');"
+        L"return 'katex='+document.querySelectorAll('.katex').length"
+        L"+' err='+document.querySelectorAll('.md-math-error').length"
+        L"+' text='+(el?el.innerText.length:-1)"
+        L"+' head=\"'+(el?el.innerText.slice(0,80).replace(/\\s+/g,' '):'')+'\"';})()",
+        h);
+    h->Release();
 }
 
 void MdViewPanel::reloadPage()
@@ -1699,6 +1725,20 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
                 "取文依赖宿主 qscintilla 导出的 QsciScintilla::text()。\n"
                 "找不到时会退化成读磁盘文件（看不到未保存的改动）。"));
     });
+
+    // 环境变量自动打开面板：NDD_MDVIEW_AUTOSHOW=1
+    // （调试用；也方便喜欢常驻预览的人开机就开）
+    if (qEnvironmentVariableIsSet("NDD_MDVIEW_AUTOSHOW")) {
+        QTimer::singleShot(3000, ctl, [ctl]() {
+            ctl->ensure();
+            if (ctl->dock) {
+                ctl->dock->show();
+                ctl->dock->raise();
+            } else if (ctl->panel) {
+                ctl->panel->show();
+            }
+        });
+    }
 
     return 0;
 }
