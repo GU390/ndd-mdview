@@ -30,8 +30,13 @@ jobs:
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $dest = Join-Path (Get-Location) '3rdparty\webview2'
           [System.IO.Compression.ZipFile]::ExtractToDirectory($nupkg, $dest)
-          Write-Host "--- extracted ---"
-          Get-ChildItem -Path $dest -Recurse -Filter 'WebView2*' | Select-Object -ExpandProperty FullName
+          # nupkg 里是 build/native/... ，搬到 CMake 期望的扁平布局
+          New-Item -ItemType Directory -Force -Path '3rdparty\webview2\include' | Out-Null
+          New-Item -ItemType Directory -Force -Path '3rdparty\webview2\x64' | Out-Null
+          Copy-Item "$dest\build\native\include\WebView2.h" '3rdparty\webview2\include\'
+          Copy-Item "$dest\build\native\x64\WebView2LoaderStatic.lib" '3rdparty\webview2\x64\'
+          Write-Host "--- webview2 files ready ---"
+          Get-ChildItem '3rdparty\webview2' -Recurse -File | Select-Object FullName, Length
 
       - name: Install Qt
         shell: pwsh
