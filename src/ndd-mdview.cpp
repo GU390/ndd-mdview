@@ -51,8 +51,7 @@
 #include <vector>
 
 #include <windows.h>
-#include <wrl/client.h>
-#include <wrl/implements.h>   // Microsoft::WRL::Callback 在这个头里
+#include <wrl/client.h>     // Microsoft::WRL::ComPtr
 
 #include "pluginGl.h"
 #include "WebView2.h"
@@ -177,6 +176,152 @@ static bool ReadScintillaText(HWND hwnd, QString& out)
     out = DecodeDocBytes(buf, (int)len, cp);
     return true;
 }
+
+// ===========================================================================
+//  手写 COM 回调对象
+//
+//  Windows SDK 的 wrl（winrt\wrl 那套）里只有 ComPtr，没有
+//  Microsoft::WRL::Callback；而 WebView2 的完成回调接口都是
+//  「IUnknown 派生 + 一个 Invoke」，所以自己实现一个带引用计数的
+//  最小 COM 对象就够了，也不必赌 SDK 里到底哪个头提供 Callback。
+// ===========================================================================
+class EnvCompletedHandler final
+    : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler
+{
+public:
+    typedef std::function<void(HRESULT, ICoreWebView2Environment*)> Fn;
+
+    explicit EnvCompletedHandler(Fn fn) : m_fn(std::move(fn)) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (ppv == nullptr)
+            return E_POINTER;
+        if (riid == __uuidof(IUnknown) ||
+            riid == __uuidof(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler)) {
+            *ppv = static_cast<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG n = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+        if (n == 0)
+            delete this;
+        return n;
+    }
+
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT code, ICoreWebView2Environment* env) override
+    {
+        m_fn(code, env);
+        return S_OK;
+    }
+
+private:
+    Fn m_fn;
+    long m_ref = 1;
+};
+
+class CtrlCompletedHandler final
+    : public ICoreWebView2CreateCoreWebView2ControllerCompletedHandler
+{
+public:
+    typedef std::function<void(HRESULT, ICoreWebView2Controller*)> Fn;
+
+    explicit CtrlCompletedHandler(Fn fn) : m_fn(std::move(fn)) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (ppv == nullptr)
+            return E_POINTER;
+        if (riid == __uuidof(IUnknown) ||
+            riid == __uuidof(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler)) {
+            *ppv = static_cast<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG n = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+        if (n == 0)
+            delete this;
+        return n;
+    }
+
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT code, ICoreWebView2Controller* ctrl) override
+    {
+        m_fn(code, ctrl);
+        return S_OK;
+    }
+
+private:
+    Fn m_fn;
+    long m_ref = 1;
+};
+
+class NavCompletedHandler final
+    : public ICoreWebView2NavigationCompletedEventHandler
+{
+public:
+    typedef std::function<void()> Fn;
+
+    explicit NavCompletedHandler(Fn fn) : m_fn(std::move(fn)) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (ppv == nullptr)
+            return E_POINTER;
+        if (riid == __uuidof(IUnknown) ||
+            riid == __uuidof(ICoreWebView2NavigationCompletedEventHandler)) {
+            *ppv = static_cast<ICoreWebView2NavigationCompletedEventHandler*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG n = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+        if (n == 0)
+            delete this;
+        return n;
+    }
+
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs*) override
+    {
+        m_fn();
+        return S_OK;
+    }
+
+private:
+    Fn m_fn;
+    long m_ref = 1;
+};
 
 // ===========================================================================
 //  预览面板（QWidget 子类，无 Q_OBJECT，不需要 moc）
@@ -380,22 +525,20 @@ bool MdViewPanel::start(const QString& pluginDir)
     }
 
     QPointer<MdViewPanel> self(this);
-    HRESULT hr = fn(nullptr, nullptr, nullptr,
-                    Microsoft::WRL::Callback<
-                        ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-                        [self](HRESULT code, ICoreWebView2Environment* env) -> HRESULT {
-                            if (!self)
-                                return S_OK;
-                            if (FAILED(code) || env == nullptr) {
-                                self->showError(QStringLiteral("创建 WebView2 环境失败 (hr=0x%1)")
-                                                    .arg((quint32)code, 8, 16, QLatin1Char('0')));
-                                return S_OK;
-                            }
-                            self->m_env = env;
-                            self->createController();
-                            return S_OK;
-                        })
-                        .Get());
+    EnvCompletedHandler* envHandler = new EnvCompletedHandler(
+        [self](HRESULT code, ICoreWebView2Environment* env) {
+            if (!self)
+                return;
+            if (FAILED(code) || env == nullptr) {
+                self->showError(QStringLiteral("创建 WebView2 环境失败 (hr=0x%1)")
+                                    .arg((quint32)code, 8, 16, QLatin1Char('0')));
+                return;
+            }
+            self->m_env = env;
+            self->createController();
+        });
+    HRESULT hr = fn(nullptr, nullptr, nullptr, envHandler);
+    envHandler->Release();     // 交出我们这份引用，COM 那份归它自己
     (void)hr;
 
     // 轮询器：只在面板可见时跑
@@ -412,31 +555,28 @@ void MdViewPanel::createController()
         return;
 
     QPointer<MdViewPanel> self(this);
-    m_env->CreateCoreWebView2Controller(
-        m_hwnd,
-        Microsoft::WRL::Callback<
-            ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-            [self](HRESULT code, ICoreWebView2Controller* ctrl) -> HRESULT {
-                if (!self)
-                    return S_OK;
-                if (FAILED(code) || ctrl == nullptr) {
-                    self->showError(QStringLiteral("创建 WebView2 控制器失败 (hr=0x%1)")
-                                        .arg((quint32)code, 8, 16, QLatin1Char('0')));
-                    return S_OK;
-                }
-                self->m_ctrl = ctrl;
+    CtrlCompletedHandler* ctrlHandler = new CtrlCompletedHandler(
+        [self](HRESULT code, ICoreWebView2Controller* ctrl) {
+            if (!self)
+                return;
+            if (FAILED(code) || ctrl == nullptr) {
+                self->showError(QStringLiteral("创建 WebView2 控制器失败 (hr=0x%1)")
+                                    .arg((quint32)code, 8, 16, QLatin1Char('0')));
+                return;
+            }
+            self->m_ctrl = ctrl;
 
-                ComPtr<ICoreWebView2> view;
-                if (FAILED(self->m_ctrl->get_CoreWebView2(&view)) || view == nullptr) {
-                    self->showError(QStringLiteral("取得 WebView2 实例失败"));
-                    return S_OK;
-                }
-                self->m_view = view;
-                self->syncBounds();
-                self->navigateToApp();
-                return S_OK;
-            })
-            .Get());
+            ComPtr<ICoreWebView2> view;
+            if (FAILED(self->m_ctrl->get_CoreWebView2(&view)) || view == nullptr) {
+                self->showError(QStringLiteral("取得 WebView2 实例失败"));
+                return;
+            }
+            self->m_view = view;
+            self->syncBounds();
+            self->navigateToApp();
+        });
+    m_env->CreateCoreWebView2Controller(m_hwnd, ctrlHandler);
+    ctrlHandler->Release();
 }
 
 void MdViewPanel::navigateToApp()
@@ -475,17 +615,14 @@ void MdViewPanel::navigateToApp()
 
     QPointer<MdViewPanel> self(this);
     EventRegistrationToken token;
-    HRESULT hr = m_view->add_NavigationCompleted(
-        Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
-            [self](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
-                if (!self)
-                    return S_OK;
-                self->m_pageReady = true;
-                self->pushCurrentText();
-                return S_OK;
-            })
-            .Get(),
-        &token);
+    NavCompletedHandler* navHandler = new NavCompletedHandler([self]() {
+        if (!self)
+            return;
+        self->m_pageReady = true;
+        self->pushCurrentText();
+    });
+    HRESULT hr = m_view->add_NavigationCompleted(navHandler, &token);
+    navHandler->Release();
     (void)hr;
 
     m_view->NavigateToString(reinterpret_cast<LPCWSTR>(html.utf16()));
