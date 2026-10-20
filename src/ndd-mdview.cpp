@@ -117,10 +117,13 @@ typedef bool (*SciBoolFn)(QsciScintilla* self);
 // this=RCX，参数 EDX/R8D/R9D，返回 long（EAX）
 typedef long (*SciSendFn)(QsciScintilla* self, unsigned int msg,
                           unsigned long wParam, long lParam);
+// sret 槽在 RCX，this 在 RDX（已用机器码核对过 text() 的真实约定）
+typedef void (*SciTextFn)(void* retSlot, void* self);
 
 // 宿主 qscintilla 那个 DLL 里的修饰名
 static const char* kIsReadOnlySymbol = "?isReadOnly@QsciScintilla@@QEBA_NXZ";
 static const char* kSendScintillaSymbol = "?SendScintilla@QsciScintillaBase@@QEBAJIKJ@Z";
+static const char* kTextSymbol = "?text@QsciScintilla@@QEBA?AVQString@@XZ";
 
 // 在已加载模块里找导出该符号的 DLL，返回函数地址
 static void* ResolveExport(const char* symbol)
@@ -286,6 +289,44 @@ static bool SafeSciText(SciSendFn send, QsciScintilla* ed, char* buf, int cap, i
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+// 探针：bool isReadOnly() const（this=RCX，返回 AL）
+static bool SafeSciBool(SciBoolFn fn, QsciScintilla* ed, bool* out)
+{
+    __try {
+        *out = fn(ed);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 调 QsciScintilla::text() 取全文。
+//
+// sret 的返回槽用**裸缓冲**而不是 QString 局部变量：
+// 万一调用过程中崩了，槽里可能是个半构造的 QString，
+// 交给 Qt 的析构函数去释放就会踩坏堆（实测会变成 BEX64 栈/缓冲区溢出）。
+// 用裸缓冲就没有这个风险 —— 崩了直接丢弃这块内存。
+//
+// 拆成两个函数：CallTextRaw 里没有任何 C++ 对象（否则 MSVC 报 C2712），
+// QString 的拷贝放在外面做。
+static bool CallTextRaw(SciTextFn fn, void* self, void* slot)
+{
+    __try {
+        fn(slot, self);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 槽里现在是一个构造好的 QString：拷出来，并释放槽里那一份
+static void TakeTextFromSlot(void* slot, QString* out)
+{
+    QString* q = reinterpret_cast<QString*>(slot);
+    *out = *q;              // 拷出来
+    q->~QString();          // 释放槽里那个
 }
 
 // 轮询间隔（毫秒）
@@ -515,11 +556,14 @@ public:
     void setHostWidget(QWidget* w) { m_host = w; }
     void setDockWidget(QDockWidget* w) { m_dock = w; }
 
-    // 取文来源：宿主 qscintilla 导出的两个纯 POD 成员
-    void setTextSource(SciBoolFn isReadOnly, SciSendFn send)
+    // 取文来源：宿主给的编辑区仿函数 + qscintilla 导出的入口
+    void setTextSource(std::function<QsciScintilla*(QWidget*)> getCurEdit,
+                       SciBoolFn isRO, SciSendFn send, SciTextFn text)
     {
-        m_isReadOnlyFn = isReadOnly;
+        m_getCurEdit = std::move(getCurEdit);
+        m_isROFn = isRO;
         m_sendFn = send;
+        m_textFn = text;
     }
 
     // 状态显示在停靠窗格标题上，方便一眼看出卡在哪一步
@@ -598,16 +642,20 @@ private:
     void navigateToApp();
     void pushCurrentText();
     void pollNow();
+    bool readCurrentText(QString& out);
     void showError(const QString& msg);
     void logChildren() const;
 
     QPointer<QWidget> m_host;
     QPointer<QDockWidget> m_dock;
-    SciBoolFn m_isReadOnlyFn = nullptr;
+    std::function<QsciScintilla*(QWidget*)> m_getCurEdit;
+    SciBoolFn m_isROFn = nullptr;
     SciSendFn m_sendFn = nullptr;
+    SciTextFn m_textFn = nullptr;
     char* m_buf = nullptr;
     int m_bufCap = 0;
     QWidget* m_lastEditor = nullptr;
+    bool m_probed = false;
     HWND m_hwnd = nullptr;
     QString m_pluginDir;
     HRESULT m_coInitResult = S_OK;
@@ -904,65 +952,112 @@ void MdViewPanel::pollNow()
         syncBounds();
 
     // 宿主的 qscintilla 模块可能比插件晚加载，这里兜底重试
-    if (!m_sendFn || !m_isReadOnlyFn) {
-        m_isReadOnlyFn = reinterpret_cast<SciBoolFn>(ResolveExport(kIsReadOnlySymbol));
+    if (!m_textFn && !m_sendFn) {
+        m_textFn = reinterpret_cast<SciTextFn>(ResolveExport(kTextSymbol));
+        m_isROFn = reinterpret_cast<SciBoolFn>(ResolveExport(kIsReadOnlySymbol));
         m_sendFn = reinterpret_cast<SciSendFn>(ResolveExport(kSendScintillaSymbol));
-        if (!m_sendFn || !m_isReadOnlyFn)
-            return;
     }
 
-    // 用 Qt 对象树定位当前编辑区（不走宿主的 std::function 仿函数）
-    QWidget* ed = FindCurrentEditor(m_host.data());
-    if (ed == nullptr)
+    QString text;
+    if (!readCurrentText(text))
         return;
-    if (ed != m_lastEditor) {
-        m_lastEditor = ed;
-        qWarning() << "[ndd-mdview] 当前编辑区 =" << (void*)ed
-                   << " class=" << ed->metaObject()->className()
-                   << " size=" << ed->width() << "x" << ed->height();
-    }
-
-    // 探针 + 长度 + 编码
-    int length = 0;
-    int codePage = 0;
-    bool readOnly = false;
-    if (!SafeSciProbe(m_isReadOnlyFn, m_sendFn, reinterpret_cast<QsciScintilla*>(ed),
-                      &length, &codePage, &readOnly)) {
-        qWarning() << "[ndd-mdview] 访问 qscintilla 时发生访问违例，"
-                      "编辑器指针=" << (void*)ed << "，本轮跳过";
-        return;
-    }
-
-    if (length < 0)
-        length = 0;
-
-    // 低地址缓冲区（兼容 32 位 lParam）
-    if (m_buf == nullptr || m_bufCap < length + 2) {
-        if (m_buf) {
-            VirtualFree(m_buf, 0, MEM_RELEASE);
-            m_buf = nullptr;
-            m_bufCap = 0;
-        }
-        const int want = qMax(length + 4096, 1 << 20);
-        m_buf = AllocLowBuffer((SIZE_T)want);
-        m_bufCap = m_buf ? want : 0;
-    }
-    if (m_buf == nullptr)
-        return;
-    if (length > 0)
-        memset(m_buf, 0, (size_t)length + 1);
-
-    if (!SafeSciText(m_sendFn, reinterpret_cast<QsciScintilla*>(ed), m_buf, m_bufCap, length)) {
-        qWarning() << "[ndd-mdview] SCI_GETTEXT 发生访问违例，本轮跳过";
-        return;
-    }
-
-    const QString text = DecodeDocBytes(m_buf, length, codePage);
     if (text == m_currentText)
         return;
 
     m_currentText = text;
     pushCurrentText();
+}
+
+// 取当前编辑区的全文。四条路依次尝试，成功就用哪条。
+bool MdViewPanel::readCurrentText(QString& out)
+{
+    // 候选 1：宿主给的 getCurEdit 仿函数
+    QsciScintilla* fromHost = nullptr;
+    if (m_getCurEdit)
+        fromHost = m_getCurEdit(m_host.data());
+
+    // 候选 2：Qt 对象树里认 className == "ScintillaEditView"
+    QWidget* ed = FindCurrentEditor(m_host.data());
+
+    if (!m_probed) {
+        m_probed = true;
+        qWarning() << "[ndd-mdview] 指针对照: Qt树 =" << (void*)ed
+                   << " 宿主仿函数 =" << (void*)fromHost;
+        if (m_isROFn) {
+            bool ro = false;
+            if (ed && SafeSciBool(m_isROFn, reinterpret_cast<QsciScintilla*>(ed), &ro))
+                qWarning() << "[ndd-mdview] isReadOnly(Qt树指针) =" << ro;
+            else
+                qWarning() << "[ndd-mdview] isReadOnly(Qt树指针) -> 失败";
+            if (fromHost && SafeSciBool(m_isROFn, fromHost, &ro))
+                qWarning() << "[ndd-mdview] isReadOnly(宿主指针) =" << ro;
+            else
+                qWarning() << "[ndd-mdview] isReadOnly(宿主指针) -> 失败";
+        }
+    }
+
+    // 路 1 / 路 2：调 QsciScintilla::text()
+    if (m_textFn) {
+        alignas(8) unsigned char slot[32];
+        if (fromHost) {
+            memset(slot, 0, sizeof(slot));
+            if (CallTextRaw(m_textFn, fromHost, slot)) {
+                TakeTextFromSlot(slot, &out);
+                return true;
+            }
+        }
+        if (ed) {
+            memset(slot, 0, sizeof(slot));
+            if (CallTextRaw(m_textFn, ed, slot)) {
+                TakeTextFromSlot(slot, &out);
+                return true;
+            }
+        }
+    }
+
+    // 路 3：SCI 消息（SendScintilla）
+    if (m_sendFn && ed) {
+        int length = 0;
+        int codePage = 0;
+        bool readOnly = false;
+        if (SafeSciProbe(m_isROFn, m_sendFn, reinterpret_cast<QsciScintilla*>(ed),
+                         &length, &codePage, &readOnly) && length > 0) {
+            if (m_buf == nullptr || m_bufCap < length + 2) {
+                if (m_buf) {
+                    VirtualFree(m_buf, 0, MEM_RELEASE);
+                    m_buf = nullptr;
+                    m_bufCap = 0;
+                }
+                const int want = qMax(length + 4096, 1 << 20);
+                m_buf = AllocLowBuffer((SIZE_T)want);
+                m_bufCap = m_buf ? want : 0;
+            }
+            if (m_buf) {
+                memset(m_buf, 0, (size_t)length + 1);
+                if (SafeSciText(m_sendFn, reinterpret_cast<QsciScintilla*>(ed),
+                                m_buf, m_bufCap, length)) {
+                    out = DecodeDocBytes(m_buf, length, codePage);
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 路 4（兜底）：读磁盘上的文件。
+    // 宿主把文件路径放在编辑区的 "filePath" 动态属性里（setFilePathProperty）。
+    // 缺点是看不到未保存的改动，但至少预览能出内容。
+    if (ed) {
+        const QString path = ed->property("filePath").toString();
+        if (!path.isEmpty()) {
+            QFile f(path);
+            if (f.open(QIODevice::ReadOnly)) {
+                out = QString::fromUtf8(f.readAll());
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 void MdViewPanel::showError(const QString& msg)
@@ -1006,8 +1101,10 @@ public:
     QPointer<QDockWidget> dock;
     MdViewPanel* panel = nullptr;
     QString pluginDir;
-    SciBoolFn isReadOnlyFn = nullptr;
+    std::function<QsciScintilla*(QWidget*)> getCurEdit;
+    SciBoolFn isROFn = nullptr;
     SciSendFn sendFn = nullptr;
+    SciTextFn textFn = nullptr;
 
     void ensure()
     {
@@ -1016,16 +1113,16 @@ public:
 
         // 取文入口在这里才解析 —— 插件被扫描时 qmyedit_qt5.dll 未必已经加载，
         // 而等到用户真正点菜单时，宿主早就把编辑区建起来了。
-        if (!sendFn) {
+        if (!textFn) {
+            textFn = reinterpret_cast<SciTextFn>(ResolveExport(kTextSymbol));
+            isROFn = reinterpret_cast<SciBoolFn>(ResolveExport(kIsReadOnlySymbol));
             sendFn = reinterpret_cast<SciSendFn>(ResolveExport(kSendScintillaSymbol));
-            isReadOnlyFn = reinterpret_cast<SciBoolFn>(ResolveExport(kIsReadOnlySymbol));
         }
-        if (sendFn == nullptr || isReadOnlyFn == nullptr) {
+        if (textFn == nullptr && sendFn == nullptr) {
             qWarning() << "[ndd-mdview] 找不到宿主 qscintilla 导出的"
-                          " SendScintilla / isReadOnly，预览将没有内容";
+                          " text / SendScintilla，预览将只能显示磁盘上的文件";
         } else {
-            qWarning() << "[ndd-mdview] 已定位宿主 qscintilla 的"
-                          " SendScintilla / isReadOnly";
+            qWarning() << "[ndd-mdview] 已定位宿主 qscintilla 的取文入口";
         }
 
         QMainWindow* mw = host ? qobject_cast<QMainWindow*>(host.data()) : nullptr;
@@ -1035,7 +1132,7 @@ public:
             panel = new MdViewPanel(dock);
             panel->setHostWidget(host);
             panel->setDockWidget(dock);
-            panel->setTextSource(isReadOnlyFn, sendFn);
+            panel->setTextSource(getCurEdit, isROFn, sendFn, textFn);
             // setWidget 会把 panel 重新挂到 dock 内部容器上，
             // 必须在它之后才 winId()，否则原生窗口会被重建（WebView2 父句柄失效）。
             dock->setWidget(panel);
@@ -1049,7 +1146,7 @@ public:
             panel->setWindowTitle(QStringLiteral("Markdown 实时预览"));
             panel->resize(760, 900);
             panel->setHostWidget(host);
-            panel->setTextSource(isReadOnlyFn, sendFn);
+            panel->setTextSource(getCurEdit, isROFn, sendFn, textFn);
             panel->start(pluginDir);
             panel->show();
         }
@@ -1100,8 +1197,8 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
                               NDD_PROC_DATA* pProcData)
 {
     Q_UNUSED(pluginCallBack);
-    // 宿主给的 getCurEdit 仿函数实测返回的是垃圾指针（调它必崩），
-    // 签名要保留（ABI），但不用它 —— 编辑区改由 Qt 对象树定位。
+    // 宿主给的 getCurEdit 仿函数保留（签名是 ABI 的一部分），
+    // 实测它返回的指针不可靠，所以只当候选之一，失败会自动换下一条路。
     Q_UNUSED(getCurEdit);
 
     // m_menuType==0 的正常路径下 pProcData 有效（含 m_pAction）。
@@ -1112,8 +1209,10 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
     MdController* ctl = new MdController(pNotepad);
     ctl->host = pNotepad;
     ctl->pluginDir = QFileInfo(strFileName).absolutePath();
-    ctl->isReadOnlyFn = reinterpret_cast<SciBoolFn>(ResolveExport(kIsReadOnlySymbol));
+    ctl->getCurEdit = getCurEdit;
+    ctl->isROFn = reinterpret_cast<SciBoolFn>(ResolveExport(kIsReadOnlySymbol));
     ctl->sendFn = reinterpret_cast<SciSendFn>(ResolveExport(kSendScintillaSymbol));
+    ctl->textFn = reinterpret_cast<SciTextFn>(ResolveExport(kTextSymbol));
     g_controller = ctl;
 
     QObject::connect(pProcData->m_pAction, &QAction::triggered, ctl,
