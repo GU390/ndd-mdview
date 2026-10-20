@@ -394,6 +394,17 @@ public:
     void setHostWidget(QWidget* w) { m_host = w; }
     void setDockWidget(QDockWidget* w) { m_dock = w; }
 
+    // 状态显示在停靠窗格标题上，方便一眼看出卡在哪一步
+    void setStatus(const QString& s)
+    {
+        m_status = s;
+        if (m_dock) {
+            m_dock->setWindowTitle(m_status.isEmpty()
+                                       ? QStringLiteral("Markdown 实时预览")
+                                       : QStringLiteral("Markdown 实时预览 | ") + m_status);
+        }
+    }
+
     // 初始化（异步创建 WebView2）。返回 false 表示立即失败。
     bool start(const QString& pluginDir);
 
@@ -422,6 +433,14 @@ protected:
         if (m_poll)
             m_poll->start();
         pollNow();
+
+        // 布局可能还没稳定，过一会儿再对一次 bounds、并补一次推送
+        QTimer::singleShot(0, this, [this]() { syncBounds(); });
+        QTimer::singleShot(400, this, [this]() {
+            syncBounds();
+            m_lastPayload.clear();
+            pushCurrentText();
+        });
     }
 
     void hideEvent(QHideEvent* e) override
@@ -441,6 +460,8 @@ private:
         r.top = 0;
         r.right = width();
         r.bottom = height();
+        if (r.right <= 0 || r.bottom <= 0)
+            return;
         m_ctrl->put_Bounds(r);
     }
 
@@ -450,6 +471,7 @@ private:
     void pushCurrentText();
     void pollNow();
     void showError(const QString& msg);
+    void logChildren() const;
 
     QPointer<QWidget> m_host;
     QPointer<QDockWidget> m_dock;
@@ -464,6 +486,7 @@ private:
 
     QTimer* m_poll = nullptr;
     QString m_currentText;
+    QString m_status;
     QByteArray m_lastPayload;
     bool m_pageReady = false;
 };
@@ -584,6 +607,7 @@ bool MdViewPanel::start(const QString& pluginDir)
     }
     qWarning() << "[ndd-mdview] CreateCoreWebView2EnvironmentWithOptions hr=0x"
                << (quint32)hr;
+    setStatus(QStringLiteral("env ok"));
 
     // 轮询器：只在面板可见时跑
     m_poll = new QTimer(this);
@@ -616,8 +640,10 @@ void MdViewPanel::createController()
                 return;
             }
             self->m_view = view;
+            self->setStatus(QStringLiteral("ctrl ok"));
             self->syncBounds();
             self->navigateToApp();
+            self->logChildren();
         });
     m_env->CreateCoreWebView2Controller(m_hwnd, ctrlHandler);
     ctrlHandler->Release();
@@ -663,6 +689,8 @@ void MdViewPanel::navigateToApp()
         if (!self)
             return;
         self->m_pageReady = true;
+        self->setStatus(QStringLiteral("page ok"));
+        self->m_lastPayload.clear();
         self->pushCurrentText();
     });
     HRESULT hr = m_view->add_NavigationCompleted(navHandler, &token);
@@ -670,6 +698,41 @@ void MdViewPanel::navigateToApp()
     (void)hr;
 
     m_view->NavigateToString(reinterpret_cast<LPCWSTR>(html.utf16()));
+
+    // 乐观地先推一次；等 NavigationCompleted 再强制推一次（页面刚加载完时
+    // 之前的 ExecuteScript 会丢失）
+    m_pageReady = true;
+    m_lastPayload.clear();
+    pushCurrentText();
+}
+
+void MdViewPanel::logChildren() const
+{
+    if (m_hwnd == nullptr)
+        return;
+    wchar_t cls[256];
+    cls[0] = L'\0';
+    GetClassNameW(m_hwnd, cls, 256);
+    RECT r;
+    GetClientRect(m_hwnd, &r);
+    qWarning() << "[ndd-mdview] panel hwnd class=" << QString::fromWCharArray(cls)
+               << " client=" << (r.right - r.left) << "x" << (r.bottom - r.top);
+
+    // 列一下子窗口，看看 WebView2 的子窗口在不在、大小对不对
+    struct Ctx { QStringList out; };
+    Ctx ctx;
+    EnumChildWindows(m_hwnd, [](HWND h, LPARAM lp) -> BOOL {
+        Ctx* c = reinterpret_cast<Ctx*>(lp);
+        wchar_t c2[256];
+        c2[0] = L'\0';
+        GetClassNameW(h, c2, 256);
+        RECT rr;
+        GetClientRect(h, &rr);
+        c->out << QStringLiteral("%1 %2x%3").arg(QString::fromWCharArray(c2))
+                      .arg(rr.right - rr.left).arg(rr.bottom - rr.top);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    qWarning() << "[ndd-mdview] panel children:" << ctx.out.join(' | ');
 }
 
 void MdViewPanel::pushCurrentText()
@@ -681,6 +744,7 @@ void MdViewPanel::pushCurrentText()
     if (payload == m_lastPayload)
         return;
     m_lastPayload = payload;
+    setStatus(QStringLiteral("push %1B").arg(payload.size()));
 
     const QString js = QStringLiteral("window.mdUpdate('")
         + QString::fromLatin1(payload) + QStringLiteral("')");
@@ -700,6 +764,10 @@ void MdViewPanel::pollNow()
 {
     if (!m_host)
         return;
+
+    // 顺手再对一次 bounds：停靠/浮动时 Qt 可能不触发 resizeEvent
+    if (m_ctrl)
+        syncBounds();
 
     HWND sci = FindScintillaEdit(reinterpret_cast<HWND>(m_host->winId()));
     if (sci == nullptr)
