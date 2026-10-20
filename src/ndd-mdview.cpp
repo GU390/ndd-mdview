@@ -148,6 +148,8 @@ public:
 typedef bool (*SciBoolFn)(QsciScintilla* self);
 // this=RCX，返回 int（EAX）
 typedef int (*SciIntFn)(QsciScintilla* self);
+// this=RCX，参数 EDX，无返回值
+typedef void (*SciVoidIntFn)(QsciScintilla* self, int line);
 // this=RCX，参数 EDX/R8D/R9D，返回 long（EAX）
 typedef long (*SciSendFn)(QsciScintilla* self, unsigned int msg,
                           unsigned long wParam, long lParam);
@@ -169,6 +171,9 @@ static const char* kIsModifiedSymbol = "?isModified@QsciScintilla@@QEBA_NXZ";
 static const char* kCurLineSymbol = "?getCurrentLineNumber@QsciScintilla@@QEBAHXZ";
 static const char* kSendScintillaSymbol = "?SendScintilla@QsciScintillaBase@@QEBAJIKJ@Z";
 static const char* kTextSymbol = "?text@QsciScintilla@@QEBA?AVQString@@XZ";
+// 滚动同步用的高层 API（比 SCI 消息干净，QScintilla 自己实现了）
+static const char* kFirstVisibleLineSymbol = "?firstVisibleLine@QsciScintilla@@QEBAHXZ";
+static const char* kSetFirstVisibleLineSymbol = "?setFirstVisibleLine@QsciScintilla@@QEAAXH@Z";
 
 // 在已加载模块里找导出该符号的 DLL，返回函数地址
 static void* ResolveExport(const char* symbol)
@@ -908,8 +913,8 @@ private:
     QWidget* m_connTab = nullptr;
     // 滚动同步
     QWidget* m_scrollEditor = nullptr;
-    QScrollBar* m_scrollBar = nullptr;
-    QMetaObject::Connection m_scrollConn;
+    SciIntFn m_firstLineFn = nullptr;
+    SciVoidIntFn m_setFirstLineFn = nullptr;
     QTimer* m_scrollPoll = nullptr;
     int m_lastEditorLine = -1;
     int m_lastWebLine = -1;
@@ -990,12 +995,6 @@ void MdViewPanel::setupScrollSync(QWidget* editor)
     if (m_scrollEditor == editor)
         return;
 
-    // 断掉旧的
-    if (m_scrollConn) {
-        QObject::disconnect(m_scrollConn);
-        m_scrollConn = QMetaObject::Connection();
-    }
-    m_scrollBar = nullptr;
     m_scrollEditor = editor;
     m_lastEditorLine = -1;
     m_lastWebLine = -1;
@@ -1003,66 +1002,57 @@ void MdViewPanel::setupScrollSync(QWidget* editor)
     if (editor == nullptr)
         return;
 
-    // 优先用编辑区自己的滚动条信号（事件驱动，零 CPU）
-    const QList<QScrollBar*> bars = editor->findChildren<QScrollBar*>();
-    for (int i = 0; i < bars.size(); ++i) {
-        if (bars.at(i)->orientation() == Qt::Vertical) {
-            m_scrollBar = bars.at(i);
-            break;
-        }
+    // 用 qscintilla 自己的高层 API 读/写滚动位置：
+    //   int  firstVisibleLine() const
+    //   void setFirstVisibleLine(int)
+    // ⚠️ QScintilla 并不用 QAbstractScrollArea 那个滚动条（实测 setValue 改了值
+    //    但编辑区不滚），所以别去碰 findChild<QScrollBar*>()。
+    // 检测用 100ms 轮询一次「首行」，比每次复制整篇文档便宜得多。
+    if (!m_scrollPoll) {
+        m_scrollPoll = new QTimer(this);
+        m_scrollPoll->setInterval(100);
+        QObject::connect(m_scrollPoll, &QTimer::timeout,
+                         this, [this]() { syncScrollFromEditor(); });
     }
-    if (m_scrollBar) {
-        m_scrollConn = QObject::connect(m_scrollBar, &QScrollBar::valueChanged,
-                                       this, [this](int) { syncScrollFromEditor(); });
-        qWarning() << "[ndd-mdview] 滚动同步: 用编辑区滚动条信号"
-                   << "range=" << m_scrollBar->minimum() << ".." << m_scrollBar->maximum()
-                   << " value=" << m_scrollBar->value()
-                   << " pageStep=" << m_scrollBar->pageStep();
-    } else {
-        // 退路：定时轮询首行（只在面板可见时跑）
-        if (!m_scrollPoll) {
-            m_scrollPoll = new QTimer(this);
-            m_scrollPoll->setInterval(100);
-            QObject::connect(m_scrollPoll, &QTimer::timeout,
-                             this, [this]() { syncScrollFromEditor(); });
-        }
+    if (isVisible())
         m_scrollPoll->start();
-        qWarning() << "[ndd-mdview] 滚动同步: 退回 100ms 轮询";
-    }
-
-    // 顺带验一下 SendScintilla 能不能用（读编辑区首行）
-    qWarning() << "[ndd-mdview] 滚动同步: 编辑区首行 ="
-               << editorFirstVisibleLine();
+    qWarning() << "[ndd-mdview] 滚动同步: 编辑区首行 =" << editorFirstVisibleLine()
+               << " 总行数 =" << editorLineCount();
 }
 
 int MdViewPanel::editorFirstVisibleLine()
 {
-    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
+    if (m_firstLineFn == nullptr || m_scrollEditor == nullptr)
         return -1;
     int line = -1;
     __try {
-        line = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
-                             SCI_GETFIRSTVISIBLELINE, 0, 0);
+        line = m_firstLineFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor));
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
     return line;
 }
 
+int MdViewPanel::editorLineCount()
+{
+    if (m_sendFn == nullptr || m_scrollEditor == nullptr)
+        return -1;
+    int n = -1;
+    __try {
+        n = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                          SCI_GETLINECOUNT, 0, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+    return n;
+}
+
 void MdViewPanel::scrollEditorToLine(int line)
 {
-    if (m_sendFn == nullptr || m_scrollEditor == nullptr || line < 0)
+    if (m_setFirstLineFn == nullptr || m_scrollEditor == nullptr || line < 0)
         return;
-    // 优先用滚动条（QScintilla 的滚动条范围就是行号）
-    if (m_scrollBar) {
-        const int v = m_scrollBar->value();
-        m_scrollBar->setValue(line);
-        if (m_scrollBar->value() != v)
-            return;
-    }
     __try {
-        m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
-                 SCI_LINESCROLLTO, (unsigned long)line, 0);
+        m_setFirstLineFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor), line);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
@@ -1582,6 +1572,8 @@ void MdViewPanel::pollNow()
         m_textFn = reinterpret_cast<SciTextFn>(ResolveExport(kTextSymbol));
         m_isROFn = reinterpret_cast<SciBoolFn>(ResolveExport(kIsReadOnlySymbol));
         m_sendFn = reinterpret_cast<SciSendFn>(ResolveExport(kSendScintillaSymbol));
+        m_firstLineFn = reinterpret_cast<SciIntFn>(ResolveExport(kFirstVisibleLineSymbol));
+        m_setFirstLineFn = reinterpret_cast<SciVoidIntFn>(ResolveExport(kSetFirstVisibleLineSymbol));
     }
 
     QString text;
@@ -1727,38 +1719,27 @@ int MdViewPanel::editorLineCount()
 void MdViewPanel::testScrollSync(int line)
 {
     qWarning() << "[ndd-mdview] 同步测试: 初始 firstLine=" << editorFirstVisibleLine()
-               << " lineCount=" << editorLineCount()
-               << " sbValue=" << (m_scrollBar ? m_scrollBar->value() : -1);
-
-    // ① 用滚动条滚
-    if (m_scrollBar)
-        m_scrollBar->setValue(line);
-    QTimer::singleShot(600, this, [this, line]() {
-        qWarning() << "[ndd-mdview] 同步测试: ①滚条滚动后 firstLine=" << editorFirstVisibleLine()
-                   << " sbValue=" << (m_scrollBar ? m_scrollBar->value() : -1);
-        // ② 用 SCI_LINESCROLLTO 滚
-        scrollEditorToLine(line);
-        QTimer::singleShot(600, this, [this, line]() {
-            qWarning() << "[ndd-mdview] 同步测试: ②LINESCROLLTO后 firstLine=" << editorFirstVisibleLine()
-                       << " sbValue=" << (m_scrollBar ? m_scrollBar->value() : -1);
-            // ③ 问网页侧
-            ExecScriptHandler* h = new ExecScriptHandler(
-                [](HRESULT code, LPCWSTR result) {
-                    if (FAILED(code) || result == nullptr) {
-                        qWarning() << "[ndd-mdview] 同步测试: 问不到网页";
-                        return;
-                    }
-                    qWarning() << "[ndd-mdview] 同步测试: ③网页侧 =" << QString::fromWCharArray(result);
-                });
-            m_view->ExecuteScript(
-                L"(function(){"
-                L"var els=document.querySelectorAll('#md [data-line]');"
-                L"return 'dataLine='+els.length"
-                L"+' scrollY='+Math.round(window.pageYOffset||0)"
-                L"+' curLine='+(window.mdCurrentLine?window.mdCurrentLine():'no-fn');})()",
-                h);
-            h->Release();
-        });
+               << " lineCount=" << editorLineCount();
+    scrollEditorToLine(line);
+    QTimer::singleShot(800, this, [this, line]() {
+        qWarning() << "[ndd-mdview] 同步测试: 滚动到第" << line << "行后 firstLine="
+                   << editorFirstVisibleLine();
+        ExecScriptHandler* h = new ExecScriptHandler(
+            [](HRESULT code, LPCWSTR result) {
+                if (FAILED(code) || result == nullptr) {
+                    qWarning() << "[ndd-mdview] 同步测试: 问不到网页";
+                    return;
+                }
+                qWarning() << "[ndd-mdview] 同步测试: 网页侧 =" << QString::fromWCharArray(result);
+            });
+        m_view->ExecuteScript(
+            L"(function(){"
+            L"var els=document.querySelectorAll('#md [data-line]');"
+            L"return 'dataLine='+els.length"
+            L"+' scrollY='+Math.round(window.pageYOffset||0)"
+            L"+' curLine='+(window.mdCurrentLine?window.mdCurrentLine():'no-fn');})()",
+            h);
+        h->Release();
     });
 }
 
