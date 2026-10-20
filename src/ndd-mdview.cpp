@@ -1955,6 +1955,7 @@ void MdViewPanel::logRenderStats()
         L"(function(){var el=document.getElementById('md');"
         L"return 'katex='+document.querySelectorAll('.katex').length"
         L"+' err='+document.querySelectorAll('.md-math-error').length"
+        L"+' sel='+document.querySelectorAll('.md-sel').length"
         L"+' text='+(el?el.innerText.length:-1)"
         L"+' head=\"'+(el?el.innerText.slice(0,80).replace(/\\s+/g,' '):'')+'\"';})()",
         h);
@@ -2307,6 +2308,12 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
         QTimer::singleShot(8000, ctl, [ctl]() {
             if (ctl->panel)
                 ctl->panel->testSelectionSync(5, 6);
+        });
+        // 选区是 100ms 轮询发现的，等 1.5s 再取一次渲染统计，
+        // 这时 sel= 就是「编辑区选区 -> 预览高亮」的落地证据。
+        QTimer::singleShot(9500, ctl, [ctl]() {
+            if (ctl->panel)
+                ctl->panel->logRenderStats();
         });
     }
 
