@@ -426,7 +426,12 @@ static void TakeTextFromSlot(void* slot, QString* out)
 {
     QString* q = reinterpret_cast<QString*>(slot);
     *out = *q;              // 拷出来
-    q->~QString();          // 释放槽里那个
+    // ⚠️ 空文档时宿主给回来的是「共享空串」（QArrayData::shared_null），
+    //    那是全局静态对象，refcount 初始是 -1；
+    //    去析构它会把那个静态的 refcount 减成 -2，属于悄悄改坏全局状态。
+    //    所以只在拿到真正的独立数据时才析构。
+    if (!q->isNull())
+        q->~QString();      // 释放槽里那个
 }
 
 // ===========================================================================
@@ -990,6 +995,7 @@ private:
     // 会被同一个窗口一起误杀 —— 表现就是「在右边选了，左边不动」。
     qint64 m_selSuppressUntil = 0;
     bool m_probed = false;
+    bool m_routeLogged = false;
     bool m_warnedFallback = false;
     MdSettings m_settings;
     HWND m_hwnd = nullptr;
@@ -1942,6 +1948,7 @@ bool MdViewPanel::readCurrentText(QString& out)
             memset(slot, 0, sizeof(slot));
             if (CallTextRaw(m_textFn, fromHost, slot)) {
                 TakeTextFromSlot(slot, &out);
+                if (!m_routeLogged) { m_routeLogged = true; qWarning() << "[ndd-mdview] 取文路径 = text()（宿主仿函数指针）"; }
                 return true;
             }
         }
@@ -1949,6 +1956,7 @@ bool MdViewPanel::readCurrentText(QString& out)
             memset(slot, 0, sizeof(slot));
             if (CallTextRaw(m_textFn, ed, slot)) {
                 TakeTextFromSlot(slot, &out);
+                if (!m_routeLogged) { m_routeLogged = true; qWarning() << "[ndd-mdview] 取文路径 = text()（Qt 对象树指针）"; }
                 return true;
             }
         }
@@ -1976,6 +1984,7 @@ bool MdViewPanel::readCurrentText(QString& out)
                 if (SafeSciText(m_sendFn, reinterpret_cast<QsciScintilla*>(ed),
                                 m_buf, m_bufCap, length)) {
                     out = DecodeDocBytes(m_buf, length, codePage);
+                    if (!m_routeLogged) { m_routeLogged = true; qWarning() << "[ndd-mdview] 取文路径 = SCI 消息"; }
                     return true;
                 }
             }
