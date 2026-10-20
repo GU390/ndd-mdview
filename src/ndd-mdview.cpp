@@ -841,6 +841,9 @@ public:
     // 自测：在编辑区里选中 l1..l2 行（验证选区同步）
     void testSelectionSync(int l1, int l2);
 
+    // 自测：在预览里选中第 blockIndex 个块（验证「预览选区 -> 编辑区选中」）
+    void testWebSelectionSync(int blockIndex);
+
     // 把渲染结果统计回读到日志（无头验证用：katex 元素数、公式出错数、正文长度）
     void logRenderStats();
 
@@ -1980,6 +1983,40 @@ void MdViewPanel::testSelectionSync(int l1, int l2)
                << "行（位置 " << gs << ".." << ge << "，回读确认）";
 }
 
+// 自测：反向（预览 -> 编辑区）。
+// 在预览里选中第 blockIndex 个块，浏览器的 selectionchange 会触发页面的
+// selectionchange 监听，页面按协议 postMessage('S'+起+','+止) 给宿主，
+// 宿主再把编辑区选到对应行 —— 由 onWebSelection 打印回读结果。
+void MdViewPanel::testWebSelectionSync(int blockIndex)
+{
+    if (!m_view)
+        return;
+    const QString js = QStringLiteral(
+        "(function(){"
+        " var els = document.querySelectorAll('#md [data-line]');"
+        " if (!els || els.length <= %1) { return 'no-block(total=' + els.length + ')'; }"
+        " var el = els[%1];"
+        " var r = document.createRange();"
+        " r.selectNodeContents(el);"
+        " var s = window.getSelection();"
+        " s.removeAllRanges(); s.addRange(r);"
+        " return 'picked data-line=' + el.getAttribute('data-line')"
+        " + '..' + (el.getAttribute('data-line2') || el.getAttribute('data-line'))"
+        " + ' text=' + (s.toString() || '').replace(/\\s+/g, ' ').slice(0, 24);"
+        "})()").arg(blockIndex);
+    ExecScriptHandler* h = new ExecScriptHandler(
+        [](HRESULT code, LPCWSTR result) {
+            if (FAILED(code) || result == nullptr) {
+                qWarning() << "[ndd-mdview] 网页选区自测: 取回失败";
+                return;
+            }
+            qWarning() << "[ndd-mdview] 网页选区自测: 已在预览里选中 ->"
+                       << QString::fromWCharArray(result);
+        });
+    m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), h);
+    h->Release();
+}
+
 void MdViewPanel::logRenderStats()
 {
     if (!m_view)
@@ -2355,6 +2392,15 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
         QTimer::singleShot(9500, ctl, [ctl]() {
             if (ctl->panel)
                 ctl->panel->logRenderStats();
+        });
+    }
+
+    // 环境变量自测选区同步（反向：预览选区 -> 编辑区选中）：NDD_MDVIEW_TESTSELWEB=1
+    // 选第 3 个块（"## 2. 块级公式"），编辑区应该选中第 8 行。
+    if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTSELWEB")) {
+        QTimer::singleShot(8000, ctl, [ctl]() {
+            if (ctl->panel)
+                ctl->panel->testWebSelectionSync(3);
         });
     }
 
