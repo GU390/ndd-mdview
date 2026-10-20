@@ -2054,7 +2054,9 @@ void MdViewPanel::testSelectionSync(int l1, int l2)
         return;
     }
     qWarning() << "[ndd-mdview] 选区自测: 已在编辑区选中第" << l1 << ".." << l2
-               << "行（位置 " << gs << ".." << ge << "，回读确认）";
+               << "行（位置 " << gs << ".." << ge << "，回读确认）"
+               << "  |  编辑区视口首行=" << editorFirstVisibleLine()
+               << " 总行数=" << editorLineCount();
 }
 
 // 自测：反向（预览 -> 编辑区）。
@@ -2503,9 +2505,14 @@ NDD_EXPORT int NDD_PROC_MAIN(QWidget* pNotepad,
 
     // 环境变量自测选区同步：NDD_MDVIEW_TESTSEL=1
     if (qEnvironmentVariableIsSet("NDD_MDVIEW_TESTSEL")) {
-        QTimer::singleShot(8000, ctl, [ctl]() {
+        // NDD_MDVIEW_TESTSEL=5   -> 选第 5..6 行
+        // NDD_MDVIEW_TESTSEL=171 -> 选第 171..171 行（用来复现「选区把视口带跑」）
+        const int tsel = qEnvironmentVariableIntValue("NDD_MDVIEW_TESTSEL");
+        const int l1 = tsel > 0 ? tsel : 5;
+        const int l2 = tsel > 0 ? tsel : 6;
+        QTimer::singleShot(8000, ctl, [ctl, l1, l2]() {
             if (ctl->panel)
-                ctl->panel->testSelectionSync(5, 6);
+                ctl->panel->testSelectionSync(l1, l2);
         });
         // 选区是 100ms 轮询发现的，等 1.5s 再取一次渲染统计，
         // 这时 sel= 就是「编辑区选区 -> 预览高亮」的落地证据。
