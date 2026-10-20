@@ -363,6 +363,74 @@ WebView2 的父句柄是面板自己的 HWND（`WA_NativeWindow` + `winId()`）�
 插件用 `/MT` 静态链接 CRT。宿主目录里只有 14.32 的 `msvcp140.dll`，
 云端 VS2022 编出的 `/MD` 会要求更新的运行库，装进宿主会报「找不到入口点」。
 
+## 官方 ABI 版本口径
+
+宿主 ABI 有两个来源：**官方说明书**（规定接口长什么样）和**宿主导出表**（规定这个版本
+实际有什么）。这两件事分开记，升级时照着下面两张表逐项核对，不用重新逆向。
+
+> 官方说明书全文在本仓库 [`docs/plugin-dev-manual.md`](docs/plugin-dev-manual.md)
+> （原件 `docs/plugin-dev-manual.docx`，出自 [gitee.com/cxasm/ndd-plugin](https://gitee.com/cxasm/ndd-plugin)，
+> GPL-3.0，Notepad-- 官方）。它写于 2023 年、对标宿主 1.21/2.0。
+
+### A. 依据手册（接口形状）
+
+| 项 | 手册口径 | 本插件实现 | 手册位置 |
+|---|---|---|---|
+| 插件入口 | `NDD_PROC_MAIN(QWidget* pNotepad, const QString& strFileName, getCurEdit, pluginCallBack, NDD_PROC_DATA*)` | 同名同签名 | §3.1 / §3.2 |
+| 插件标识 | `NDD_PROC_IDENTIFY(NDD_PROC_DATA*)`，填 `m_strPlugName` / `m_strComment` / `m_version` / `m_auther` / `m_menuType` | 5 个字段都填 | §3.1 |
+| 二级菜单 | `m_menuType = 1`，在 `s_procData.m_rootMenu` 下自行 `addAction` | 一致（挂在「插件 → Markdown 预览 (WebView2)」下） | §3.2 |
+| `pProcData` 生命周期 | **必须拷贝一份**，函数返回后外面会释放 | `s_procData = *pProcData;` | §3.1 / §3.2 |
+| `getCurEdit` | 宿主传入的仿函数，返回当前 `QsciScintilla*` | 当作「当前编辑区」的首选来源 | §3.1 |
+| `pluginCallBack` | 2.0 起支持：插件可发消息给主程序执行命令 | **未使用**（列为可优化项） | 修改记录表 |
+| 编译环境 | Qt 5.15.2 + VS2019 / qmake；插件只依赖 qscintilla | 云端 VS2022 + Qt 5.15.2 + CMake；**不链接 qscintilla** | §2.1 |
+| 兼容性 | Qt 版本一致 + **QScintilla ABI 一致** | 规避：不链 qscintilla，运行时 `GetProcAddress` 借宿主导出 | §4 |
+
+### B. 依据宿主导出（实测值，宿主 3.9.1）
+
+| 事实 | 实测方式 | 值 |
+|---|---|---|
+| `qmyedit_qt5.dll` 导出总数 | 解析 PE 导出表（`scratch/pe_exports.py`） | **2403**（3.8.3 与 3.9.1 一致，未变） |
+| 插件依赖的宿主符号 | `GetProcAddress` 逐个探测 | 7 个**全部命中**（清单见下） |
+| Scintilla 消息号 | 宿主源码 `src/qscint/scintilla/include/Scintilla.h` | `SCI_GETSELECTIONSTART 2143` / `SCI_GETSELECTIONEND 2145` / `SCI_SETSEL 2160` / `SCI_LINEFROMPOSITION 2166` / `SCI_POSITIONFROMLINE 2167` / `SCI_ENSUREVISIBLE 2232` / `SCI_GETLINECOUNT 2154` / `SCI_GETFIRSTVISIBLELINE 2152` |
+| 编辑控件的类继承 | 宿主源码 `ScintillaEditView` | `QsciScintilla : QsciScintillaBase : QAbstractScrollArea : QFrame : QWidget : QObject`——**单继承 ⇒ 各基类偏移全为 0**，所以 `QWidget* == QsciScintilla*` |
+| 菜单挂载点 | 宿主源码 `ccnotepad.cpp`（`onPlugFound` / `slot_markdownPreview`） | 一级菜单下的二级项 |
+| 标签页销毁语义 | 同上（`removeTab(index); pw->deleteLater();`） | 关标签页**真的会销毁**编辑控件 ⇒ 插件里一律用 `QPointer`，不能用裸指针 |
+| 宿主 Qt 版本 | `Qt5Core.dll` 版本资源 | **5.15.2**（与手册推荐版本一致） |
+
+依赖的 7 个宿主符号（3.9.1 实测全部存在）：
+
+```
+?isReadOnly@QsciScintilla@@QEBA_NXZ
+?isModified@QsciScintilla@@QEBA_NXZ
+?getCurrentLineNumber@QsciScintilla@@QEBAHXZ
+?SendScintilla@QsciScintillaBase@@QEBAJIKJ@Z
+?text@QsciScintilla@@QEBA?AVQString@@XZ
+?firstVisibleLine@QsciScintilla@@QEBAHXZ
+?setFirstVisibleLine@QsciScintilla@@QEAAXH@Z
+```
+
+### C. 接口演进（手册修改记录表）
+
+| 宿主版本 | 官方新增 |
+|---|---|
+| 1.21 | 首次支持插件 |
+| 1.22.2 | 支持插件二级菜单的创建 |
+| 2.0 | 插件可发消息给主程序执行命令 |
+
+本插件按 **≥ 2.0** 口径实现（在宿主 3.9.1 上运行验证）。
+
+### 冲突时以谁为准
+
+1. 手册描述的**函数与字段** → 以**手册**为准（不自己发明 ABI）。
+2. 具体**函数地址、消息号、宿主行为** → 以**实测的宿主导出表**为准。
+3. 两者对不上（宿主改了导出） → 先信宿主导出表；导出真没了才走降级兜底
+   （现在就有兜底：`QsciScintilla::text()` 取不到时退化为读磁盘上的文件，日志会写明走了哪条路）。
+
+### 可优化项（依据手册发现，尚未实现）
+
+- **`pluginCallBack` 没用**：手册 2.0 起支持插件反向给主程序发消息（如新建文件）。
+  目前预览面板完全靠自己实现主程序联动，这是官方留给插件的正路。
+
 ## 从源码构建
 
 需要：CMake ≥ 3.20、Qt 5.15.2 MSVC x64（`win64_msvc2019_64`）、
@@ -465,3 +533,6 @@ v1.5 的修法：**这些指针全部改成 `QPointer<QWidget>`**。
 
 markdown-it 采用 MIT 协议，版权归其作者所有。
 本插件代码随本仓库分发。
+
+`docs/` 下的《Ndd 插件编程开发说明》是 Notepad-- 官方文档，GPL-3.0 许可，
+出处与转出方式见 [`docs/README.md`](docs/README.md)。
