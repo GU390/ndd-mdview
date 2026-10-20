@@ -1,7 +1,7 @@
 # ndd-mdview
 
 给 [Notepad--](https://gitee.com/cxasm/notepad--) 做的插件：**用 Microsoft Edge WebView2
-在编辑器右侧实时渲染 Markdown**，替代内置那套「独立窗口 + Qt `QTextEdit::setMarkdown()`」
+在编辑器右侧渲染 Markdown**，替代内置那套「独立窗口 + Qt `QTextEdit::setMarkdown()`」
 的预览。
 
 ![类型：插件](https://img.shields.io/badge/type-plugin-0969da)
@@ -199,6 +199,28 @@ mov rax, r14          ; 返回槽地址放 RAX
    给**相交**的块加 `.md-sel`（黄底）。选一段文字，选中的那几行会整块高亮。
 3. 反方向：网页 `selectionchange` → 算出选中内容所在块的行号区间 →
    `postMessage('S'+起+','+止)` → 宿主用 `SCI_SETSEL` 在编辑区选中对应行。
+
+> ⚠️ **Scintilla 消息号必须用宿主自带那份头文件里的值。**
+> Notepad-- 打包的是自己的 qscintilla 分支，编号跟通用 Scintilla 文档对不上。
+> 权威来源：`github.com/cxasm/notepad--` → `src/qscint/scintilla/include/Scintilla.h`。
+>
+> 本轮踩过的坑（v1.4 修复）：之前写的是
+> `SCI_SETSEL=2304` / `SCI_GETSELECTIONEND=2144` / `SCI_LINEFROMPOSITION=2146`，
+> 在宿主的头文件里这三个号分别是
+> `SCI_CHARLEFT`（光标左移一格）/ `SCI_SETSELECTIONEND`（设置！）/ `SCI_SETPRINTMAGNIFICATION`。
+> 后果是**两个方向的选区同步都静默失效**：发出去的 `SCI_SETSEL` 实际是「光标左移」，
+> 而每 100ms 的选区轮询里那句「读选区终点」实际是「把选区终点改到 0」，
+> 把用户自己拉的选区也搅了。
+>
+> 教训有两条：
+> ① 消息发出去 ≠ 宿主执行了。`SCI_SETSEL` 之后必须**回读** `SCI_GETSELECTIONSTART/END`
+>    比对，不符就当失败 —— 只看 `return true` 会被「没抛异常」骗过去。
+> ② 同理，日志里那句「已选中」不能当证据：**它无条件打印**。
+>    v1.3 的「预览→编辑器 已实测通过」就是被这句日志骗的，
+>    实际上编辑区里一个字都没选中。真正的证据要来自回读或截图。
+>
+> 现在 `SCI_SETSEL` 之后会回读并打印 `位置 x..y（回读确认）`；
+> 选区同步的落地证据是渲染统计里的 `sel=`（预览里被加 `.md-sel` 的块数）。
 
 ### 排版用现成的 github-markdown-css
 

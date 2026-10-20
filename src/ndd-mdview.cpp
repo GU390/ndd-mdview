@@ -299,18 +299,28 @@ static QWidget* FindCurrentEditor(QWidget* host)
 //  取文：SCI 消息 + 低地址缓冲区
 // ---------------------------------------------------------------------------
 
-// Scintilla 消息号（公开 API，跨版本稳定）
+// Scintilla 消息号
+// ⚠️ 必须用宿主自带的那份 Scintilla.h 里的值，不能照抄网上通用的表：
+//    Notepad-- 打包的是自己的 qscintilla 分支，编号跟通用文档对不上。
+//    权威来源：github.com/cxasm/notepad-- → src/qscint/scintilla/include/Scintilla.h
+//    （本轮踩坑：之前写的 2304/2144/2146 全是「别的消息」——
+//      2304 = SCI_CHARLEFT（光标左移一格），不是 SCI_SETSEL；
+//      2144 = SCI_SETSELECTIONEND（设置！），不是 SCI_GETSELECTIONEND；
+//      2146 = SCI_SETPRINTMAGNIFICATION，不是 SCI_LINEFROMPOSITION。
+//      症状是「日志说选中了，其实一个字都没选上」，而且每 100ms 还会
+//      把用户自己在编辑区拉的选区终点改到 0。）
 #define SCI_GETLENGTH      2006
 #define SCI_GETTEXT        2182
 #define SCI_GETCODEPAGE    2137
-#define SCI_GETFIRSTVISIBLELINE 2153
+#define SCI_GETFIRSTVISIBLELINE 2152
 #define SCI_GETLINECOUNT     2154
 #define SCI_GETSELECTIONSTART 2143
-#define SCI_GETSELECTIONEND   2144
-#define SCI_LINEFROMPOSITION  2146
+#define SCI_GETSELECTIONEND   2145
+#define SCI_LINEFROMPOSITION  2166
 #define SCI_POSITIONFROMLINE  2167
-#define SCI_SETSEL            2304
-#define SCI_LINESCROLLTO   2160
+#define SCI_SETSEL            2160
+// 这版 Scintilla 已经没有 SCI_LINESCROLLTO 了（2168=SCI_LINESCROLL, 2169=SCI_SCROLLCARET），
+// 所以滚动只能用 QScintilla 的 firstVisibleLine()/setFirstVisibleLine()。
 
 // 在 4GB 以下申请一块缓冲区。
 // SendScintilla 的 lParam 修饰名里是 32 位（J/K），指针有可能被截断，
@@ -1199,6 +1209,14 @@ bool MdViewPanel::editorSelectionLines(int* l1, int* l2)
                            SCI_LINEFROMPOSITION, (unsigned long)start, 0);
         le = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
                            SCI_LINEFROMPOSITION, (unsigned long)end, 0);
+        // 选区终点正好落在下一行行首时（用户拖到行首就松手），
+        // 实际覆盖到的是上一行行尾，这里把 le 收回来，别多高亮一个块。
+        if (end > start && le > ls) {
+            int lineStart = (int)m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
+                                          SCI_POSITIONFROMLINE, (unsigned long)le, 0);
+            if (lineStart == end)
+                le -= 1;
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -1227,6 +1245,7 @@ void MdViewPanel::syncSelectionFromEditor()
         return;
     m_lastSelL1 = l1;
     m_lastSelL2 = l2;
+    qWarning() << "[ndd-mdview] 选区同步: 编辑区选区 ->" << l1 << ".." << l2 << "，推给网页";
     const QString js = QStringLiteral("window.mdHighlight && window.mdHighlight(%1,%2);").arg(l1).arg(l2);
     m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), nullptr);
 }
@@ -1234,7 +1253,11 @@ void MdViewPanel::syncSelectionFromEditor()
 // 在编辑区里选中 l1..l2 行（1 基）。
 // 单独拆出来：带 __try 的函数里不能有需要回卷的 C++ 对象（MSVC 报 C2712），
 // 所以这个函数里只准出现指针和 int。
-static bool SciSelectLines(SciSendFn send, QsciScintilla* ed, int l1, int l2)
+// ⚠️ 发完 SCI_SETSEL 必须回读确认：消息发出去 ≠ 宿主执行了。
+//    之前用错的消息号（2304=SCI_CHARLEFT）就是这样「静默失败」的，
+//    而调用方只看见 return true，日志还照样打「已选中」。
+static bool SciSelectLines(SciSendFn send, QsciScintilla* ed, int l1, int l2,
+                            int* outStart, int* outEnd)
 {
     __try {
         int start = (int)send(ed, SCI_POSITIONFROMLINE, (unsigned long)(l1 - 1), 0);
@@ -1242,7 +1265,14 @@ static bool SciSelectLines(SciSendFn send, QsciScintilla* ed, int l1, int l2)
         if (end < start)
             end = start;
         send(ed, SCI_SETSEL, (unsigned long)start, (long)end);
-        return true;
+        // 回读：只有真的选上了才算成功
+        int gs = (int)send(ed, SCI_GETSELECTIONSTART, 0, 0);
+        int ge = (int)send(ed, SCI_GETSELECTIONEND, 0, 0);
+        if (outStart)
+            *outStart = gs;
+        if (outEnd)
+            *outEnd = ge;
+        return (gs == start && ge == end);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -1258,10 +1288,16 @@ void MdViewPanel::onWebSelection(int l1, int l2)
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (now < m_scrollSuppressUntil)
         return;
-    if (!SciSelectLines(m_sendFn, reinterpret_cast<QsciScintilla*>(m_scrollEditor), l1, l2))
+    int gs = -1, ge = -1;
+    if (!SciSelectLines(m_sendFn, reinterpret_cast<QsciScintilla*>(m_scrollEditor), l1, l2,
+                        &gs, &ge)) {
+        qWarning() << "[ndd-mdview] 选区同步: 网页行" << l1 << ".." << l2
+                   << "-> 编辑区选中失败（回读 gs=" << gs << " ge=" << ge << "）";
         return;
+    }
     m_scrollSuppressUntil = now + 250;
-    qWarning() << "[ndd-mdview] 选区同步: 网页行 " << l1 << ".." << l2 << " -> 编辑区选中";
+    qWarning() << "[ndd-mdview] 选区同步: 网页行 " << l1 << ".." << l2
+               << " -> 编辑区选中（位置 " << gs << ".." << ge << "，回读确认）";
 }
 
 void MdViewPanel::onEditorTextChanged()
@@ -1934,9 +1970,14 @@ void MdViewPanel::testSelectionSync(int l1, int l2)
 {
     if (m_sendFn == nullptr || m_scrollEditor == nullptr)
         return;
-    if (!SciSelectLines(m_sendFn, reinterpret_cast<QsciScintilla*>(m_scrollEditor), l1, l2))
+    int gs = -1, ge = -1;
+    if (!SciSelectLines(m_sendFn, reinterpret_cast<QsciScintilla*>(m_scrollEditor), l1, l2,
+                        &gs, &ge)) {
+        qWarning() << "[ndd-mdview] 选区自测: 选中失败（回读不符 gs=" << gs << " ge=" << ge << "）";
         return;
-    qWarning() << "[ndd-mdview] 选区自测: 已在编辑区选中第" << l1 << ".." << l2 << "行";
+    }
+    qWarning() << "[ndd-mdview] 选区自测: 已在编辑区选中第" << l1 << ".." << l2
+               << "行（位置 " << gs << ".." << ge << "，回读确认）";
 }
 
 void MdViewPanel::logRenderStats()
