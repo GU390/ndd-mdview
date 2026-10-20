@@ -51,6 +51,7 @@
 #include <vector>
 
 #include <windows.h>
+#include <objbase.h>        // CoInitializeEx / CoUninitialize
 #include <wrl/client.h>     // Microsoft::WRL::ComPtr
 
 #include "pluginGl.h"
@@ -385,9 +386,13 @@ public:
         if (m_poll) {
             m_poll->stop();
         }
+        if (m_comInitialized) {
+            CoUninitialize();
+        }
     }
 
     void setHostWidget(QWidget* w) { m_host = w; }
+    void setDockWidget(QDockWidget* w) { m_dock = w; }
 
     // 初始化（异步创建 WebView2）。返回 false 表示立即失败。
     bool start(const QString& pluginDir);
@@ -447,8 +452,11 @@ private:
     void showError(const QString& msg);
 
     QPointer<QWidget> m_host;
+    QPointer<QDockWidget> m_dock;
     HWND m_hwnd = nullptr;
     QString m_pluginDir;
+    HRESULT m_coInitResult = S_OK;
+    bool m_comInitialized = false;
 
     ComPtr<ICoreWebView2Environment> m_env;
     ComPtr<ICoreWebView2Controller> m_ctrl;
@@ -539,38 +547,14 @@ bool MdViewPanel::start(const QString& pluginDir)
         return false;
     }
 
-    // WebView2Loader.dll：优先从插件目录找，找不到再走系统搜索
-    HMODULE hLoader = nullptr;
-    const QString loaderPath = QDir(pluginDir).filePath(QStringLiteral("WebView2Loader.dll"));
-    if (!loaderPath.isEmpty()) {
-        hLoader = LoadLibraryExW(reinterpret_cast<LPCWSTR>(loaderPath.utf16()), nullptr,
-                                 LOAD_WITH_ALTERED_SEARCH_PATH);
-    }
-    if (hLoader == nullptr) {
-        hLoader = LoadLibraryW(L"WebView2Loader.dll");
-    }
-    if (hLoader == nullptr) {
-        showError(QStringLiteral("WebView2Loader.dll 加载失败\r\n"
-                                 "请确认它和本插件 DLL 放在同一目录，"
-                                 "或已安装 Microsoft Edge WebView2 Runtime。"));
-        return false;
-    }
+    // WebView2 需要 STA。Qt 不会自动初始化 COM，这里自己来。
+    m_coInitResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    m_comInitialized = (m_coInitResult == S_OK);   // S_FALSE 表示本来就有，不能再 uninit
+    if (FAILED(m_coInitResult))
+        qWarning() << "[ndd-mdview] CoInitializeEx failed, hr=0x" << (quint32)m_coInitResult;
 
-    typedef HRESULT(WINAPI* PFN_CreateEnvWithOptions)(
-        PCWSTR browserExecutableFolder,
-        PCWSTR userDataFolder,
-        ICoreWebView2EnvironmentOptions* environmentOptions,
-        ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* environmentCreatedHandler);
-
-    PFN_CreateEnvWithOptions fn =
-        reinterpret_cast<PFN_CreateEnvWithOptions>(
-            GetProcAddress(hLoader, "CreateCoreWebView2EnvironmentWithOptions"));
-    if (fn == nullptr) {
-        showError(QStringLiteral("WebView2Loader.dll 缺少 "
-                                 "CreateCoreWebView2EnvironmentWithOptions 入口"));
-        return false;
-    }
-
+    // WebView2 的 loader 是**静态链接**进来的（见 CMakeLists 里的 /WHOLEARCHIVE），
+    // 所以直接调用即可，不需要 LoadLibrary 去动态找 WebView2Loader.dll。
     QPointer<MdViewPanel> self(this);
     EnvCompletedHandler* envHandler = new EnvCompletedHandler(
         [self](HRESULT code, ICoreWebView2Environment* env) {
@@ -584,9 +568,22 @@ bool MdViewPanel::start(const QString& pluginDir)
             self->m_env = env;
             self->createController();
         });
-    HRESULT hr = fn(nullptr, nullptr, nullptr, envHandler);
+
+    HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, nullptr, nullptr, envHandler);
+    if (FAILED(hr)) {
+        // 退回到老接口（少一个参数，某些版本 loader 只导这个）
+        HRESULT hr2 = CreateCoreWebView2Environment(envHandler);
+        if (SUCCEEDED(hr2))
+            hr = hr2;
+    }
     envHandler->Release();     // 交出我们这份引用，COM 那份归它自己
-    (void)hr;
+    if (FAILED(hr)) {
+        showError(QStringLiteral("创建 WebView2 环境失败 (hr=0x%1)")
+                      .arg((quint32)hr, 8, 16, QLatin1Char('0')));
+        return false;
+    }
+    qWarning() << "[ndd-mdview] CreateCoreWebView2EnvironmentWithOptions hr=0x"
+               << (quint32)hr;
 
     // 轮询器：只在面板可见时跑
     m_poll = new QTimer(this);
@@ -722,6 +719,13 @@ void MdViewPanel::showError(const QString& msg)
 {
     qWarning() << "[ndd-mdview]" << msg;
 
+    // WebView2 都没起来的时候没法往面板里画东西，
+    // 至少把停靠窗格的标题和 tooltip 改掉，让人一眼看出是哪儿坏了。
+    if (m_dock) {
+        m_dock->setWindowTitle(QStringLiteral("Markdown 预览启动失败"));
+        m_dock->setToolTip(msg);
+    }
+
     const QString html = QStringLiteral(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>"
         "body{font-family:'Microsoft YaHei',sans-serif;padding:24px;color:#b42318;"
@@ -764,6 +768,7 @@ public:
             dock->setObjectName(QStringLiteral("ndd_mdview_dock"));
             panel = new MdViewPanel(dock);
             panel->setHostWidget(host);
+            panel->setDockWidget(dock);
             // setWidget 会把 panel 重新挂到 dock 内部容器上，
             // 必须在它之后才 winId()，否则原生窗口会被重建（WebView2 父句柄失效）。
             dock->setWidget(panel);
