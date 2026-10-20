@@ -74,6 +74,13 @@
 | `NDD_MDVIEW_TESTSEL=171` | 自测选区同步（正向：选编辑区第 171 行；**行号可指定**） |
 | `NDD_MDVIEW_TESTSCROLL=200` | 自测「用户滚网页」：让网页滚到第 200 行，编辑区应该跟着滚过去 |
 | `NDD_MDVIEW_TESTMAP=1` | 自测行号映射：核对第 1/3/5 行在左右两边是不是同一段内容 |
+| `NDD_MDVIEW_TESTRO=1` | 自测**只读文档**路径：把当前编辑区真的设成只读（`SCI_SETREADONLY`），验证插件不再调宿主 `getCurEdit`（宿主对只读文档会响铃 + 刷状态栏） |
+| `NDD_MDVIEW_TESTRO=hostcall` | 同上，但**额外强制调用**宿主回调（= v1.7 旧行为），用来做 A/B 对照 |
+
+> 为什么只读路径要专门造钩子：普通 .md 打开在宿主里**不是**只读的
+> （`openTextFile` 里 `isReadOnly` 恒为 false），只有「超大文件只读模式」和「tail 监控模式」
+> 才会只读 —— 前者要 >100 MB 文件 + 弹窗，后者要点菜单。
+> 钩子走的是 `SCI_SETREADONLY`，和宿主 `setReadOnly(true)` 是同一条路，所以等价。
 
 > 自测钩子都会**等页面内容渲染完**再跑（页面渲染完会 postMessage('R') 给宿主）——
 > 页面脚本就位 ≠ 内容渲染完了，块还没有 `data-line`，

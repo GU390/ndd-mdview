@@ -321,6 +321,7 @@ static QWidget* FindCurrentEditor(QWidget* host)
 #define SCI_POSITIONFROMLINE  2167
 #define SCI_SETSEL            2160
 #define SCI_ENSUREVISIBLE     2232   // 把光标最小幅度滚进视野（不会跳）
+#define SCI_SETREADONLY       2171   // 设只读（宿主 Scintilla.h 的值，测试钩子用）
 // 这版 Scintilla 已经没有 SCI_LINESCROLLTO 了（2168=SCI_LINESCROLL, 2169=SCI_SCROLLCARET），
 // 所以滚动只能用 QScintilla 的 firstVisibleLine()/setFirstVisibleLine()。
 
@@ -778,6 +779,16 @@ public:
     explicit MdViewPanel(QWidget* parent = nullptr)
         : QWidget(parent)
     {
+        // 调试钩子 NDD_MDVIEW_TESTRO：
+        //   1    -> 把当前编辑区设成只读（SCI_SETREADONLY），走 v1.8 新逻辑（跳过宿主回调）
+        //   hostcall -> 同样设成只读，但强制调用宿主回调（= v1.7 旧行为），用于 A/B 对照
+        // 为什么需要它：普通 .md 打开在宿主里**不是**只读的
+        // （openTextFile 里 isReadOnly 恒为 false），只有「超大文件只读模式」和
+        // 「tail 监控模式」才会只读 —— 前者要 >100MB 文件 + 弹窗，后者要点菜单。
+        // SCI_SETREADONLY 走的正是宿主 setReadOnly(true) 那条路，所以等价。
+        const QByteArray testro = qgetenv("NDD_MDVIEW_TESTRO");
+        m_testRO = (!testro.isEmpty() && testro != "0");
+        m_testForceHostCall = (testro == "hostcall");
     }
 
     ~MdViewPanel() override
@@ -1027,6 +1038,10 @@ private:
     bool m_routeLogged = false;
     // v1.8：只读文档时跳过宿主 getCurEdit 回调（否则宿主会响铃），换文档后允许再提示一次
     bool m_roSkipLogged = false;
+    // 调试钩子（见构造函数）：模拟只读文档
+    bool m_testRO = false;
+    bool m_testRODone = false;
+    bool m_testForceHostCall = false;
     bool m_warnedFallback = false;
     MdSettings m_settings;
     HWND m_hwnd = nullptr;
@@ -1970,6 +1985,15 @@ void MdViewPanel::pollNow()
         m_setFirstLineFn = reinterpret_cast<SciVoidIntFn>(ResolveExport(kSetFirstVisibleLineSymbol));
     }
 
+    // 调试钩子：把编辑区真的设成只读（宿主对只读文档会响铃，这条路径平时碰不到）
+    if (m_testRO && !m_testRODone && m_sendFn && m_lastEditor.data()) {
+        m_testRODone = true;
+        m_sendFn(reinterpret_cast<QsciScintilla*>(m_lastEditor.data()),
+                 SCI_SETREADONLY, 1, 0);
+        qWarning() << "[ndd-mdview] 测试钩子: 已把编辑区设为只读 (SCI_SETREADONLY=2171)"
+                      << (m_testForceHostCall ? "，并强制走宿主回调（旧行为）" : "");
+    }
+
     QString text;
     if (!readCurrentText(text))
         return;
@@ -2001,7 +2025,7 @@ bool MdViewPanel::readCurrentText(QString& out)
 
     // 候选 1：宿主给的 getCurEdit 仿函数（只读时跳过，见上）
     QsciScintilla* fromHost = nullptr;
-    if (!edReadOnly && m_getCurEdit)
+    if ((!edReadOnly || m_testForceHostCall) && m_getCurEdit)
         fromHost = m_getCurEdit(m_host.data());
 
     if (edReadOnly && !m_roSkipLogged) {
