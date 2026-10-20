@@ -1012,7 +1012,10 @@ void MdViewPanel::setupScrollSync(QWidget* editor)
     if (m_scrollBar) {
         m_scrollConn = QObject::connect(m_scrollBar, &QScrollBar::valueChanged,
                                        this, [this](int) { syncScrollFromEditor(); });
-        qWarning() << "[ndd-mdview] 滚动同步: 用编辑区滚动条信号";
+        qWarning() << "[ndd-mdview] 滚动同步: 用编辑区滚动条信号"
+                   << "range=" << m_scrollBar->minimum() << ".." << m_scrollBar->maximum()
+                   << " value=" << m_scrollBar->value()
+                   << " pageStep=" << m_scrollBar->pageStep();
     } else {
         // 退路：定时轮询首行（只在面板可见时跑）
         if (!m_scrollPoll) {
@@ -1048,6 +1051,13 @@ void MdViewPanel::scrollEditorToLine(int line)
 {
     if (m_sendFn == nullptr || m_scrollEditor == nullptr || line < 0)
         return;
+    // 优先用滚动条（QScintilla 的滚动条范围就是行号）
+    if (m_scrollBar) {
+        const int v = m_scrollBar->value();
+        m_scrollBar->setValue(line);
+        if (m_scrollBar->value() != v)
+            return;
+    }
     __try {
         m_sendFn(reinterpret_cast<QsciScintilla*>(m_scrollEditor),
                  SCI_LINESCROLLTO, (unsigned long)line, 0);
@@ -1067,6 +1077,7 @@ void MdViewPanel::syncScrollFromEditor()
         return;
     m_lastEditorLine = line;
     m_scrollSuppressUntil = now + 250;
+    qWarning() << "[ndd-mdview] 滚动同步: 编辑区首行 ->" << line << "，推给网页";
     // data-line 是 1 基，Scintilla 行号是 0 基
     const QString js = QStringLiteral("window.mdScrollToLine(%1);").arg(line + 1);
     m_view->ExecuteScript(reinterpret_cast<LPCWSTR>(js.utf16()), nullptr);
@@ -1083,6 +1094,7 @@ void MdViewPanel::onWebScroll(int line)
         return;
     m_lastWebLine = line;
     m_scrollSuppressUntil = now + 250;
+    qWarning() << "[ndd-mdview] 滚动同步: 网页行 ->" << line << "，滚编辑区";
     scrollEditorToLine(line - 1);
 }
 
@@ -1703,6 +1715,7 @@ void MdViewPanel::testScrollSync(int line)
     QTimer::singleShot(1500, this, [this, line]() {
         if (!m_view)
             return;
+        // 一次性把网页侧的状态全问回来
         ExecScriptHandler* h = new ExecScriptHandler(
             [line](HRESULT code, LPCWSTR result) {
                 if (FAILED(code) || result == nullptr) {
@@ -1710,11 +1723,17 @@ void MdViewPanel::testScrollSync(int line)
                     return;
                 }
                 const QString s = QString::fromWCharArray(result);
-                qWarning() << "[ndd-mdview] 同步测试: 目标行 =" << line
-                           << " 网页当前行 =" << s
-                           << (s.toInt() == line ? "  ✔ 同步成功" : "  ✘ 不同步");
+                qWarning() << "[ndd-mdview] 同步测试: 目标行 =" << line << " 网页侧 =" << s;
             });
-        m_view->ExecuteScript(L"String(window.mdCurrentLine ? window.mdCurrentLine() : 'no-fn')", h);
+        m_view->ExecuteScript(
+            L"(function(){"
+            L"var els=document.querySelectorAll('#md [data-line]');"
+            L"return 'dataLine='+els.length"
+            L"+' first='+(els.length?els[0].tagName+'@'+els[0].getAttribute('data-line'):'-')"
+            L"+' scrollY='+Math.round(window.pageYOffset||0)"
+            L"+' curLine='+(window.mdCurrentLine?window.mdCurrentLine():'no-fn')"
+            L"+' mdChild='+document.getElementById('md').children.length;})()",
+            h);
         h->Release();
     });
 }
