@@ -1,0 +1,81 @@
+name: udp-punch-peer
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/udp-punch-peer.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  peer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: self-test udp egress
+        run: |
+          python3 - <<'PY'
+          import socket, struct, os
+          MAGIC = 0x2112A442
+          def q(host, port):
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(6)
+              s.sendto(struct.pack('!HHI', 0x0001, 0, MAGIC) + os.urandom(12), (host, port))
+              try:
+                  d, _ = s.recvfrom(2048)
+              except Exception as e:
+                  return 'FAIL:%s' % e
+              i = 20
+              while i + 4 <= len(d):
+                  t, l = struct.unpack('!HH', d[i:i+4]); v = d[i+4:i+4+l]
+                  if t == 0x0020:
+                      p = struct.unpack('!H', v[2:4])[0] ^ (MAGIC >> 16)
+                      return '%s:%d' % (socket.inet_ntoa(bytes(b ^ 0xff for b in v[4:8])), p)
+                  i += 4 + l + ((4 - l % 4) % 4)
+              return 'NOADDR'
+          for h, p in [('stun.voipbuster.com', 3478), ('stun.cloudflare.com', 3478),
+                       ('stun.miwifi.com', 3478), ('stun.nextcloud.com', 443)]:
+              print('SELFTEST %-26s -> %s' % (h, q(h, p)), flush=True)
+          PY
+          echo "RUNNER_EGRESS_TCP=$(curl -s -4 --max-time 15 https://ifconfig.me)"
+
+      - name: publish peer ip
+        run: |
+          IP=$(curl -s -4 --max-time 15 https://ifconfig.me)
+          echo "PEER_IP=$IP" >> $GITHUB_ENV
+          echo "$IP" > peer_ip.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add peer_ip.txt
+          git commit -m "peer ip $IP" || true
+          git push || true
+          echo "PEER_IP=$IP"
+
+      - name: wait for local client
+        run: sleep 45
+
+      - name: udp punch peer
+        run: |
+          python3 - <<'PY'
+          import socket, time
+          PEER_PORT = 45124
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(('0.0.0.0', PEER_PORT)); s.settimeout(1)
+          t0 = time.time(); got = []
+          while time.time() - t0 < 100:
+              try:
+                  data, src = s.recvfrom(4096)
+              except socket.timeout:
+                  continue
+              got.append((src, data))
+              print('RECV from %s:%d %r' % (src[0], src[1], data[:60]), flush=True)
+              # 关键: 用【另一个源端口】向对方 STUN 反射地址发包 —— 这才是真正的打洞
+              t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              t.sendto(b'PUNCH_FROM_GH_NEW_SRC_PORT', src)
+              t.close()
+              time.sleep(0.3)
+          print('SUMMARY received=%d' % len(got), flush=True)
+          for g in got:
+              print('  %s:%d %r' % (g[0][0], g[0][1], g[1][:60]), flush=True)
+          PY
