@@ -67,21 +67,37 @@ jobs:
           s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
           s.bind(('0.0.0.0', PEER_PORT)); s.settimeout(1)
           t0 = time.time(); got = []
+          lines = []
           while time.time() - t0 < 100:
               try:
                   data, src = s.recvfrom(4096)
               except socket.timeout:
                   continue
               got.append((src, data))
-              print('RECV from %s:%d %r' % (src[0], src[1], data[:60]), flush=True)
+              msg = 'RECV from %s:%d %r' % (src[0], src[1], data[:60])
+              print(msg, flush=True)
+              lines.append(msg)
               # 关键: 用【另一个源端口】向对方 STUN 反射地址发包 —— 这才是真正的打洞
               t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
               t.sendto(b'PUNCH_FROM_GH_NEW_SRC_PORT', src)
               t.close()
+              lines.append('  replied from NEW source port to %s:%d' % (src[0], src[1]))
               time.sleep(0.3)
-          print('SUMMARY received=%d' % len(got), flush=True)
+          summary = 'SUMMARY received=%d' % len(got)
+          print(summary, flush=True)
+          lines.append(summary)
           for g in got:
-              print('  %s:%d %r' % (g[0][0], g[0][1], g[1][:60]), flush=True)
+              lines.append('  %s:%d %r' % (g[0][0], g[0][1], g[1][:60]))
+          open('peer_result.txt', 'w').write('\n'.join(lines) + '\n')
           PY
 
-# retrigger 1792736655
+      - name: publish result
+        if: always()
+        run: |
+          if [ ! -f peer_result.txt ]; then echo "no result file" > peer_result.txt; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add peer_result.txt
+          git commit -m "peer result" || true
+          git push || true
+          cat peer_result.txt
