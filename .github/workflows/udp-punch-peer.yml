@@ -13,6 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
       - name: self-test udp egress
         run: |
           python3 - <<'PY'
@@ -79,3 +83,5 @@ jobs:
           for g in got:
               print('  %s:%d %r' % (g[0][0], g[0][1], g[1][:60]), flush=True)
           PY
+
+# retrigger 1792736655
