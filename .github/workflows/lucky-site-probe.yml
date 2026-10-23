@@ -1,0 +1,33 @@
+name: lucky-site-probe
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'URL to probe'
+        required: true
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: probe
+        run: |
+          {
+            echo "RUNNER_IP=$(curl -s -4 --max-time 15 https://ifconfig.me)"
+            echo "TARGET=${{ inputs.target }}"
+            echo "=== curl -sv ==="
+            curl -sv -m 30 "${{ inputs.target }}" 2>&1 | head -80
+          } > probe_result.txt 2>&1 || true
+          cat probe_result.txt
+      - name: publish
+        if: always()
+        run: |
+          if [ ! -f probe_result.txt ]; then echo "no result" > probe_result.txt; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add probe_result.txt
+          git commit -m "probe result" || true
+          git push || true
